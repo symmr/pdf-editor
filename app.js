@@ -1426,6 +1426,31 @@ async function buildPdf(PDFLib, fontkit) {
   return out.save();
 }
 
+// Inside a claude.ai Artifact the page may not start downloads itself; the
+// viewer's "downloads" capability asks them to save the file instead.
+// Returns false when the viewer declined.
+async function saveFile(filename, blob) {
+  const downloads = window.claude && window.claude.use ? await window.claude.use("downloads") : null;
+  if (downloads) {
+    try {
+      await downloads.save({ filename, data: blob });
+      return true;
+    } catch (err) {
+      if (err && err.code === "declined") return false;
+      throw new Error((err && err.message) || "ファイルを保存できませんでした");
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  return true;
+}
+
 async function download() {
   if (busy || !doc.pages.length) return;
   commitEditor();
@@ -1433,16 +1458,10 @@ async function download() {
   try {
     const { PDFLib, fontkit } = await loadPdfLib();
     const bytes = await buildPdf(PDFLib, fontkit);
-    const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `${baseName}_edited.pdf`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
+    const filename = `${baseName}_edited.pdf`;
+    if (!(await saveFile(filename, new Blob([bytes], { type: "application/pdf" })))) return;
     savedUndoDepth = undoStack.length;
-    showOk(`${link.download} を保存しました`);
+    showOk(`${filename} を保存しました`);
   } catch (err) {
     showError(`保存できませんでした: ${err.message || err}`);
   } finally {

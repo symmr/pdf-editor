@@ -7,7 +7,7 @@
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600;700&display=swap">
   <style>
     /* Same palette and components as Translation Supporter
        (cool neutrals with one electric indigo accent). */
@@ -364,6 +364,8 @@
     #overlay { touch-action: none; }
     .page-wrap[data-tool="select"] #overlay { cursor: default; }
     .page-wrap[data-tool="text"] #overlay { cursor: text; }
+    .bold-btn { font-weight: 700; padding: 0.35rem 0.6rem; }
+    .bold-btn[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--drop); }
     .page-wrap[data-tool="whiteout"] #overlay,
     .page-wrap[data-tool="highlight"] #overlay,
     .page-wrap[data-tool="box"] #overlay,
@@ -439,7 +441,7 @@
     <h1>PDF Editor</h1>
     <ol class="flow">
       <li>PDF を開く</li>
-      <li>文字の追加・白塗り・ページ整理</li>
+      <li>文字の書き換え・追加・ページ整理</li>
       <li>保存する</li>
     </ol>
     <p class="lede note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>ファイルはサーバに送られません</p>
@@ -466,6 +468,7 @@
       <div class="toolbar">
         <div class="segmented" role="group" aria-label="ツール">
           <button type="button" data-tool="select" aria-pressed="true" title="選択・移動・サイズ変更 (V)">選択</button>
+          <button type="button" data-tool="edit" aria-pressed="false" title="PDF の文字をクリックして書き換える (E)">文字を編集</button>
           <button type="button" data-tool="text" aria-pressed="false" title="クリックした位置に文字を書く (T)">テキスト</button>
           <button type="button" data-tool="whiteout" aria-pressed="false" title="ドラッグした範囲を白で塗りつぶす (W)">白塗り</button>
           <button type="button" data-tool="highlight" aria-pressed="false" title="ドラッグした範囲に色を重ねる (H)">ハイライト</button>
@@ -476,7 +479,8 @@
         <input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
         <div class="tool-group">
           <label class="field" title="色"><input type="color" id="colorInput" value="#d00000"></label>
-          <label class="field">文字 <input type="number" id="sizeInput" value="14" min="4" max="200" step="1"></label>
+          <label class="field">文字 <input type="number" id="sizeInput" value="14" min="4" max="200" step="0.5"></label>
+          <button type="button" id="boldBtn" class="bold-btn" aria-pressed="false" title="太字" aria-label="太字">B</button>
           <label class="field">線 <input type="number" id="widthInput" value="2" min="0.5" max="40" step="0.5"></label>
         </div>
         <div class="tool-group">
@@ -505,7 +509,7 @@
       <div class="row">
         <button type="button" id="appendBtn">PDF を後ろに追加</button>
         <input type="file" id="appendInput" accept="application/pdf,.pdf" multiple hidden>
-        <span class="hint">サムネイルはドラッグで並べ替え。⟲ ⟳ で回転、✕ で削除</span>
+        <span class="hint">サムネイルはドラッグで並べ替え。⟲ ⟳ で回転、✕ で削除。テキストの右下の四角をドラッグすると幅が変わり、折り返されます</span>
       </div>
     </section>
 
@@ -527,6 +531,8 @@
     <p class="msg error" id="errorMsg" hidden></p>
     <p class="msg ok" id="okMsg" hidden></p>
   </div>
+  <script src="lib/pdf-rewrite.js"></script>
+  <script src="lib/pdf-text.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

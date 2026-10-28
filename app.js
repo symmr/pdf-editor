@@ -12,21 +12,22 @@ const PDF_LIB_SRI = "sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14P
 const FONTKIT_URL = "https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js";
 const FONTKIT_SRI = "sha384-2p6U+1mmqF10USehFeRiyG2ESG9FwIqN+jxULn5w9jjQIihSn9Pt13dVCn/Hawjn";
 // The same family the page loads from Google Fonts, so text looks the same on
-// screen and in the saved file. Only the glyphs used are embedded.
-const JP_FONT_URL = "https://cdn.jsdelivr.net/npm/@expo-google-fonts/noto-sans-jp@0.4.1/400Regular/NotoSansJP_400Regular.ttf";
+// screen and in the saved file. Only the glyphs used are embedded. The URLs
+// come from lib/pdf-text.js (PDF_FONT_URL, PDF_BOLD_FONT_URL).
 const CANVAS_FONT = "\"Noto Sans JP\", sans-serif";
 
 // Text boxes are laid out from their top-left corner: line i has its baseline
-// at (i * LINE_HEIGHT + TEXT_ASCENT) * size. With Noto Sans JP this matches
-// where a textarea with the same line-height puts the baseline.
+// at (i * lineHeight + baselineOffset(lineHeight)) * size. With Noto Sans JP
+// (ascent 1.16, descent 0.288) this is where a textarea with the same
+// line-height puts the baseline.
 const LINE_HEIGHT = 1.3;
-const TEXT_ASCENT = 1.08;
+const baselineOffset = (lineHeight) => lineHeight / 2 + 0.436;
 const HIGHLIGHT_OPACITY = 0.35;
 const ZOOM_STEPS = [0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 const THUMB_WIDTH = 132;
 const HANDLE_SIZE = 9;
 const MAX_UNDO = 100;
-const TOOL_KEYS = { v: "select", t: "text", w: "whiteout", h: "highlight", r: "box", p: "pen" };
+const TOOL_KEYS = { v: "select", e: "edit", t: "text", w: "whiteout", h: "highlight", r: "box", p: "pen" };
 // Highlights keep their own color so switching tools does not turn them red.
 const toolColors = { highlight: "#ffd400", other: "#d00000" };
 const colorSlot = (name) => (name === "highlight" ? "highlight" : "other");
@@ -42,6 +43,7 @@ const toolButtons = [...document.querySelectorAll("[data-tool]")].filter((el) =>
 const imageBtn = document.getElementById("imageBtn");
 const imageInput = document.getElementById("imageInput");
 const colorInput = document.getElementById("colorInput");
+const boldBtn = document.getElementById("boldBtn");
 const sizeInput = document.getElementById("sizeInput");
 const widthInput = document.getElementById("widthInput");
 const undoBtn = document.getElementById("undoBtn");
@@ -95,6 +97,10 @@ const thumbCache = new Map(); // "src:index:rotation" -> Promise<canvas>
 const thumbCanvases = [];
 const imageElements = new Map();
 const measureCtx = document.createElement("canvas").getContext("2d");
+const pageBlocks = new Map(); // "src:index" -> Promise<blocks> of the original text
+const loadedBlocks = new Map(); // same, once resolved
+const libDocs = new Map(); // src -> Promise<pdf-lib PDFDocument>, read only
+let hoverBlock = null;
 
 // --- messages ---------------------------------------------------------------
 
@@ -283,6 +289,9 @@ async function openFiles(fileList, append) {
       doc.pages = [];
       doc.images.clear();
       thumbCache.clear();
+      pageBlocks.clear();
+      loadedBlocks.clear();
+      libDocs.clear();
       undoStack = [];
       redoStack = [];
       selectedId = null;
@@ -378,12 +387,56 @@ function drawOverlay() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  for (const a of currentPage().annots) {
-    if (editing && editing.annotId === a.id) continue;
-    drawAnnot(ctx, a, view.vp, view.rotation);
+  drawAnnots(ctx, currentPage().annots, view.vp, view.rotation, editing && editing.annotId);
+  if (tool === "edit") {
+    loadBlocks(currentPage());
+    drawBlockOutlines(ctx);
   }
   const sel = selectedAnnot();
   if (sel && !(editing && editing.annotId === sel.id)) drawSelection(ctx, sel);
+}
+
+// Edited text first hides the original: a cover in the background color
+// sampled around it. Saving removes the original from the page content
+// instead (see buildPdf), so the cover is only a preview.
+function drawAnnots(ctx, annots, vp, rotation, skipId) {
+  for (const a of annots) {
+    if (a.type !== "text" || !a.replaces) continue;
+    const r = viewRect(coverRect(a.replaces), vp);
+    ctx.fillStyle = a.replaces.fill;
+    ctx.fillRect(r.x, r.y, r.w, r.h);
+  }
+  for (const a of annots) {
+    if (a.id !== skipId) drawAnnot(ctx, a, vp, rotation);
+  }
+}
+
+// The original block's area in user space, with a little room for glyphs
+// that reach past the measured box.
+function coverRect(r) {
+  const pad = r.size * 0.12;
+  return { x1: r.x - pad, y1: r.y - pad, x2: r.x + r.w + pad, y2: r.y + r.h + pad };
+}
+
+function drawBlockOutlines(ctx) {
+  const blocks = loadedBlocks.get(blockKey(currentPage()));
+  if (!blocks) return;
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2601fd";
+  ctx.save();
+  ctx.strokeStyle = accent;
+  ctx.fillStyle = accent;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  for (const block of blocks) {
+    const r = viewRect(coverRect(block), view.vp);
+    ctx.globalAlpha = block === hoverBlock ? 0.9 : 0.45;
+    ctx.strokeRect(r.x, r.y, r.w, r.h);
+    if (block === hoverBlock) {
+      ctx.globalAlpha = 0.08;
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+    }
+  }
+  ctx.restore();
 }
 
 // Angle (clockwise, degrees) at which an upright-created text box or image
@@ -428,11 +481,12 @@ function drawAnnot(ctx, a, vp, rotation) {
     ctx.translate(x, y);
     ctx.rotate((relativeAngle(a, rotation) * Math.PI) / 180);
     if (a.type === "text") {
-      ctx.font = `${a.size * s}px ${CANVAS_FONT}`;
+      const lh = a.lineHeight || LINE_HEIGHT;
+      ctx.font = fontSpec(a, a.size * s);
       ctx.fillStyle = a.color;
       ctx.textBaseline = "alphabetic";
-      a.text.split("\n").forEach((line, i) => {
-        ctx.fillText(line, 0, (i * LINE_HEIGHT + TEXT_ASCENT) * a.size * s);
+      textLines(a).forEach((line, i) => {
+        ctx.fillText(line, 0, (i * lh + baselineOffset(lh)) * a.size * s);
       });
     } else if (a.type === "image") {
       const img = imageElement(a.image);
@@ -482,7 +536,12 @@ function ensureGlyphs(text) {
   const missing = [...new Set(text)].filter((ch) => !requestedGlyphs.has(ch));
   if (!missing.length) return;
   for (const ch of missing) requestedGlyphs.add(ch);
-  document.fonts.load(`16px ${CANVAS_FONT}`, missing.join("")).then(() => {
+  const chars = missing.join("");
+  Promise.all([
+    document.fonts.load(`16px ${CANVAS_FONT}`, chars),
+    document.fonts.load(`700 16px ${CANVAS_FONT}`, chars),
+  ]).then(() => {
+    textLayouts.clear();
     drawOverlay();
     thumbCanvases.forEach((_, i) => drawThumb(i));
   }, () => {});
@@ -496,13 +555,35 @@ function viewRect(a, vp) {
   return { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
 }
 
+const fontSpec = (a, px) => `${a.bold ? "700 " : ""}${px}px ${CANVAS_FONT}`;
+
+function measureAt(a) {
+  measureCtx.font = fontSpec(a, a.size);
+  return (str) => measureCtx.measureText(str).width;
+}
+
+// Lines of a text box: its own line breaks, plus wrapping at the box width
+// when it has one (wrapText from lib/pdf-text.js keeps Japanese line-break
+// rules). The same lines are drawn on screen and written to the PDF.
+const textLayouts = new Map();
+
+function textLines(a) {
+  if (!a.boxWidth) return a.text.split("\n");
+  const key = `${a.bold ? 1 : 0}|${a.size}|${a.boxWidth}|${a.text}`;
+  if (!textLayouts.has(key)) {
+    if (textLayouts.size > 500) textLayouts.clear();
+    textLayouts.set(key, wrapText(a.text, a.boxWidth, measureAt(a)));
+  }
+  return textLayouts.get(key);
+}
+
 // Size in PDF points of a text box or image, before rotation.
 function localSize(a) {
   if (a.type === "image") return { w: a.w, h: a.h };
-  measureCtx.font = `${a.size}px ${CANVAS_FONT}`;
-  const lines = a.text.split("\n");
-  const w = Math.max(...lines.map((line) => measureCtx.measureText(line).width), a.size * 0.5);
-  return { w, h: lines.length * LINE_HEIGHT * a.size };
+  const lines = textLines(a);
+  const measure = measureAt(a);
+  const w = a.boxWidth || Math.max(...lines.map(measure), a.size * 0.5);
+  return { w, h: Math.max(1, lines.length) * (a.lineHeight || LINE_HEIGHT) * a.size };
 }
 
 // Axis-aligned bounding box in view (CSS pixel) coordinates.
@@ -625,6 +706,8 @@ overlay.addEventListener("pointerdown", (event) => {
       drawOverlay();
       updateControls();
     }
+  } else if (tool === "edit") {
+    startBlockEdit(pt);
   } else if (tool === "text") {
     openEditor(hitTest(pt, (a) => a.type === "text"), pt);
   } else if (tool === "pen") {
@@ -646,6 +729,16 @@ overlay.addEventListener("pointerdown", (event) => {
 overlay.addEventListener("pointermove", (event) => {
   const pt = pointerPos(event);
   if (!drag) {
+    if (tool === "edit" && viewReady()) {
+      const blocks = loadedBlocks.get(blockKey(currentPage()));
+      const block = blocks ? blockAt(blocks, pt) : null;
+      overlay.style.cursor = block ? "text" : "";
+      if (block !== hoverBlock) {
+        hoverBlock = block;
+        drawOverlay();
+      }
+      return;
+    }
     if (tool !== "select" || !viewReady()) return;
     const sel = selectedAnnot();
     overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : hitTest(pt) ? "move" : "";
@@ -676,8 +769,11 @@ overlay.addEventListener("pointermove", (event) => {
         a.w = orig.w * f;
         a.h = orig.h * f;
       } else {
-        a.size = Math.max(4, Math.round(orig.size * f * 2) / 2);
-        sizeInput.value = a.size;
+        // Text keeps its size; the handle sets the box width and the text
+        // wraps inside it.
+        const sideways = relativeAngle(a, view.rotation) % 180 !== 0;
+        const span = sideways ? pt[1] - box.y : pt[0] - box.x;
+        a.boxWidth = Math.max(a.size, Math.round((span / view.vp.scale) * 10) / 10);
       }
     }
   } else if (drag.mode === "draw") {
@@ -708,16 +804,26 @@ function endDrag() {
 }
 
 overlay.addEventListener("pointerup", endDrag);
+overlay.addEventListener("pointerleave", () => {
+  if (!hoverBlock) return;
+  hoverBlock = null;
+  drawOverlay();
+});
 overlay.addEventListener("pointercancel", endDrag);
 
 // --- text editing -------------------------------------------------------------------------
 
-function openEditor(annot, pt) {
+// created: the annotation was made for this edit (an original text block
+// taken over), so finishing without a change undoes it.
+function openEditor(annot, pt, created) {
   const page = currentPage();
   const s = view.vp.scale;
   const [x, y] = annot ? [annot.x, annot.y] : toPdf(pt);
   const size = annot ? annot.size : Number(sizeInput.value) || 14;
   const color = annot ? annot.color : colorInput.value;
+  const bold = annot ? Boolean(annot.bold) : boldBtn.getAttribute("aria-pressed") === "true";
+  const lineHeight = (annot && annot.lineHeight) || LINE_HEIGHT;
+  const boxWidth = annot && annot.boxWidth;
   const [vx, vy] = view.vp.convertToViewportPoint(x, y);
   const el = document.createElement("textarea");
   el.className = "text-editor";
@@ -728,12 +834,14 @@ function openEditor(annot, pt) {
     left: `${vx}px`,
     top: `${vy}px`,
     fontSize: `${size * s}px`,
-    lineHeight: String(LINE_HEIGHT),
+    fontWeight: bold ? "700" : "400",
+    lineHeight: String(lineHeight),
+    whiteSpace: boxWidth ? "pre-wrap" : "pre",
     color,
   });
   const autosize = () => {
     el.style.width = "0px";
-    el.style.width = `${el.scrollWidth + size * s}px`;
+    el.style.width = boxWidth ? `${boxWidth * s + 2}px` : `${el.scrollWidth + size * s}px`;
     el.style.height = "0px";
     el.style.height = `${el.scrollHeight}px`;
   };
@@ -746,7 +854,7 @@ function openEditor(annot, pt) {
   });
   el.addEventListener("blur", () => commitEditor());
   pageWrap.appendChild(el);
-  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, el };
+  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, el, created: Boolean(created) };
   if (annot) {
     selectedId = annot.id;
     syncStyleInputs(annot);
@@ -766,11 +874,22 @@ function commitEditor() {
   const page = doc.pages.find((p) => p.id === e.pageId);
   if (page) {
     const existing = e.annotId != null ? page.annots.find((a) => a.id === e.annotId) : null;
-    if (existing) {
+    if (existing && e.created) {
+      // the undo step was pushed when the block was taken over
+      if (text === existing.text) {
+        page.annots.splice(page.annots.indexOf(existing), 1);
+        undoStack.pop();
+        selectedId = null;
+      } else {
+        existing.text = text;
+      }
+    } else if (existing) {
       if (text !== existing.text) {
         pushUndo();
         const a = page.annots.find((x) => x.id === e.annotId);
-        if (text) {
+        // An edited original block stays even when emptied: its original
+        // text is still removed, which erases it.
+        if (text || a.replaces) {
           a.text = text;
         } else {
           page.annots.splice(page.annots.indexOf(a), 1);
@@ -779,7 +898,7 @@ function commitEditor() {
       }
     } else if (text) {
       pushUndo();
-      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, rotation: rotationOf(page) };
+      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, rotation: rotationOf(page) };
       page.annots.push(a);
       selectedId = a.id;
     }
@@ -794,7 +913,10 @@ function commitEditor() {
 
 function syncStyleInputs(a) {
   if (a.color) colorInput.value = a.color;
-  if (a.type === "text") sizeInput.value = a.size;
+  if (a.type === "text") {
+    sizeInput.value = a.size;
+    boldBtn.setAttribute("aria-pressed", String(Boolean(a.bold)));
+  }
   if (a.width) widthInput.value = a.width;
 }
 
@@ -807,6 +929,20 @@ function applyStyle(prop, value) {
   drawOverlay();
   drawThumb(current);
 }
+
+boldBtn.addEventListener("click", () => {
+  const a = selectedAnnot();
+  if (a && a.type === "text") {
+    pushUndo();
+    a.bold = !a.bold;
+    boldBtn.setAttribute("aria-pressed", String(a.bold));
+    ensureGlyphs(a.text);
+    drawOverlay();
+    drawThumb(current);
+  } else {
+    boldBtn.setAttribute("aria-pressed", String(boldBtn.getAttribute("aria-pressed") !== "true"));
+  }
+});
 
 colorInput.addEventListener("change", () => {
   if (selectedAnnot()) applyStyle("color", colorInput.value);
@@ -922,7 +1058,7 @@ async function drawThumb(i) {
   const ctx = canvas.getContext("2d");
   ctx.drawImage(bitmap, 0, 0);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  for (const a of page.annots) drawAnnot(ctx, a, vp, rotation);
+  drawAnnots(ctx, page.annots, vp, rotation);
 }
 
 function goTo(i) {
@@ -969,6 +1105,155 @@ function movePage(from, to) {
   doc.pages.splice(to, 0, page);
   current = doc.pages.findIndex((p) => p.id === currentId);
   renderAll();
+}
+
+// --- editing the original text ------------------------------------------------------------
+
+const blockKey = (page) => `${page.src}:${page.index}`;
+
+function libDocOf(src) {
+  if (!libDocs.has(src)) {
+    const promise = loadPdfLib().then(({ PDFLib }) =>
+      PDFLib.PDFDocument.load(doc.sources[src].bytes, { ignoreEncryption: true, updateMetadata: false }));
+    libDocs.set(src, promise);
+    promise.catch(() => libDocs.delete(src));
+  }
+  return libDocs.get(src);
+}
+
+// Text blocks (lines joined into paragraphs) of a page's original text, in
+// user space: { index, x, y, w, h, size, leading, lines, firstBaseline, text,
+// runs }. PDFs have no text boxes; extractPdfTexts (lib/pdf-text.js) groups
+// the shown strings by position, as Translation Supporter does.
+function loadBlocks(page) {
+  const key = blockKey(page);
+  if (!pageBlocks.has(key)) {
+    const promise = (async () => {
+      const pdfPage = await pdfPageOf(page);
+      // The fill colors come from the page content, read with pdf-lib.
+      let segments = [];
+      try {
+        const { PDFLib } = await loadPdfLib();
+        const libDoc = await libDocOf(page.src);
+        if (!libDoc.isEncrypted) segments = collectPageSegments(PDFLib, libDoc.getPage(page.index), new Map());
+      } catch (_) {
+        segments = [];
+      }
+      const onePage = {
+        numPages: 1,
+        getPage: async () => ({
+          view: pdfPage.view,
+          getTextContent: () => pdfPage.getTextContent(),
+          getAnnotations: async () => [],
+        }),
+      };
+      const { metadata } = await extractPdfTexts(onePage, null, { segmentsFor: () => segments });
+      return metadata.map((m, index) => ({ ...m, index }));
+    })();
+    pageBlocks.set(key, promise);
+    show(busyMsg, "文字を読み取り中…");
+    promise.then((blocks) => {
+      loadedBlocks.set(key, blocks);
+      if (tool === "edit" && currentPage() && blockKey(currentPage()) === key) {
+        drawOverlay();
+        if (!blocks.length) showError("このページには編集できる文字がありません（スキャンした画像の PDF など）");
+      }
+    }, () => {
+      pageBlocks.delete(key);
+      showError("文字を読み取れませんでした");
+    }).finally(() => { if (!busy) show(busyMsg, ""); });
+  }
+  return pageBlocks.get(key);
+}
+
+function blockAt(blocks, pt) {
+  let best = null;
+  let bestArea = Infinity;
+  for (const block of blocks) {
+    const r = viewRect(coverRect(block), view.vp);
+    if (pt[0] < r.x || pt[0] > r.x + r.w || pt[1] < r.y || pt[1] > r.y + r.h) continue;
+    if (r.w * r.h < bestArea) {
+      best = block;
+      bestArea = r.w * r.h;
+    }
+  }
+  return best;
+}
+
+// Background and text color around a block, read from the rendered page.
+function sampleBackground(block) {
+  const dpr = window.devicePixelRatio || 1;
+  const r = viewRect(coverRect(block), view.vp);
+  const x0 = Math.max(0, Math.floor((r.x - 3) * dpr));
+  const y0 = Math.max(0, Math.floor((r.y - 3) * dpr));
+  const x1 = Math.min(pdfCanvas.width, Math.ceil((r.x + r.w + 3) * dpr));
+  const y1 = Math.min(pdfCanvas.height, Math.ceil((r.y + r.h + 3) * dpr));
+  if (x1 - x0 < 6 || y1 - y0 < 6) return null;
+  const image = pdfCanvas.getContext("2d").getImageData(x0, y0, x1 - x0, y1 - y0);
+  return sampleBlockColors(image, { x0: 2, y0: 2, x1: image.width - 3, y1: image.height - 3 });
+}
+
+// The color and weight most of the block's text has.
+function mainStyle(runs) {
+  const colors = new Map();
+  let bold = 0;
+  let total = 0;
+  for (const run of runs || []) {
+    const n = run.text.length;
+    total += n;
+    if (run.bold) bold += n;
+    if (run.color) colors.set(run.color, (colors.get(run.color) || 0) + n);
+  }
+  const color = [...colors].sort((p, q) => q[1] - p[1])[0];
+  return { color: color ? color[0] : null, bold: total > 0 && bold * 2 > total };
+}
+
+// Takes over an original text block: a text annotation with the same text,
+// position, size and color replaces it, and the editor opens on it.
+function startBlockEdit(pt) {
+  const page = currentPage();
+  const blocks = loadedBlocks.get(blockKey(page));
+  const block = blocks && blockAt(blocks, pt);
+  if (!block) return;
+  const taken = page.annots.find((a) => a.type === "text" && a.replaces && a.replaces.block === block.index);
+  if (taken) {
+    openEditor(taken);
+    return;
+  }
+  const sampled = sampleBackground(block);
+  const style = mainStyle(block.runs);
+  const ink = style.color || (sampled && sampled.ink) || "000000";
+  const lineHeight = block.lines > 1 && block.leading > 0
+    ? Math.round((block.leading / block.size) * 1000) / 1000
+    : LINE_HEIGHT;
+  pushUndo();
+  const a = {
+    id: nextId++,
+    type: "text",
+    text: block.text,
+    x: block.x,
+    y: block.firstBaseline + baselineOffset(lineHeight) * block.size,
+    size: block.size,
+    color: `#${ink.toLowerCase()}`,
+    bold: style.bold,
+    lineHeight,
+    // A paragraph keeps its width (with a little slack, as the replacement
+    // font may run wider) and rewraps; a single line just grows.
+    boxWidth: block.lines > 1 ? Math.round(block.w * 1.04 * 10) / 10 : null,
+    rotation: 0, // block positions are in unrotated user space
+    replaces: {
+      block: block.index,
+      x: block.x,
+      y: block.y,
+      w: block.w,
+      h: block.h,
+      size: block.size,
+      fill: `#${((sampled && sampled.fill) || "FFFFFF").toLowerCase()}`,
+    },
+  };
+  page.annots.push(a);
+  ensureGlyphs(a.text);
+  openEditor(a, null, true);
 }
 
 // --- images -------------------------------------------------------------------------------
@@ -1058,14 +1343,19 @@ async function buildPdf(PDFLib, fontkit) {
     pages.forEach((p, i) => copied.set(p.id, copies[i]));
   }
 
-  let font = null;
-  if (doc.pages.some((p) => p.annots.some((a) => a.type === "text"))) {
+  const texts = doc.pages.flatMap((p) => p.annots.filter((a) => a.type === "text" && a.text));
+  const fonts = {}; // keyed by bold
+  if (texts.length) {
     setBusy(true, "日本語フォントを読み込み中…");
-    const fontBytes = await loadFont(JP_FONT_URL);
-    patchFontkitSubset(fontkit, fontBytes);
-    font = await out.embedFont(fontBytes, { subset: true });
+    for (const bold of [false, true]) {
+      if (!texts.some((a) => Boolean(a.bold) === bold)) continue;
+      const fontBytes = await loadFont(bold ? PDF_BOLD_FONT_URL : PDF_FONT_URL);
+      patchFontkitSubset(fontkit, fontBytes);
+      fonts[bold] = await out.embedFont(fontBytes, { subset: true });
+    }
     setBusy(true, "PDF を作成中…");
   }
+  const forms = new Map(); // form XObjects already rewritten, for removePageText
 
   const images = new Map();
   const embedImage = async (key) => {
@@ -1081,6 +1371,19 @@ async function buildPdf(PDFLib, fontkit) {
     out.addPage(pg);
     pg.setRotation(degrees(rotationOf(page)));
     const pdfPage = await pdfPageOf(page);
+    // Edited blocks: take the original strings out of the page content
+    // (lib/pdf-rewrite.js). This has to come before pdf-lib draws anything,
+    // as it replaces the page's content streams. Text it cannot find (inside
+    // an image, an unreadable font) is covered instead.
+    const edits = page.annots.filter((a) => a.type === "text" && a.replaces);
+    if (edits.length) {
+      const { done } = removePageText(PDFLib, pg, edits.map((a) => ({ id: a.id, ...a.replaces })), [], forms);
+      for (const a of edits) {
+        if (done.has(a.id)) continue;
+        const r = coverRect(a.replaces);
+        pg.drawRectangle({ x: r.x1, y: r.y1, width: r.x2 - r.x1, height: r.y2 - r.y1, color: hexToRgb(rgb, a.replaces.fill) });
+      }
+    }
     for (const a of page.annots) {
       const color = a.color ? hexToRgb(rgb, a.color) : undefined;
       if (a.type === "rect") {
@@ -1107,10 +1410,11 @@ async function buildPdf(PDFLib, fontkit) {
         const vp = pdfPage.getViewport({ scale: 1, rotation: a.rotation });
         const [vx, vy] = vp.convertToViewportPoint(a.x, a.y);
         if (a.type === "text") {
-          a.text.split("\n").forEach((line, i) => {
+          const lh = a.lineHeight || LINE_HEIGHT;
+          textLines(a).forEach((line, i) => {
             if (!line) return;
-            const [x, y] = vp.convertToPdfPoint(vx, vy + (i * LINE_HEIGHT + TEXT_ASCENT) * a.size);
-            pg.drawText(line, { x, y, size: a.size, font, color, rotate: degrees(a.rotation) });
+            const [x, y] = vp.convertToPdfPoint(vx, vy + (i * lh + baselineOffset(lh)) * a.size);
+            pg.drawText(line, { x, y, size: a.size, font: fonts[Boolean(a.bold)], color, rotate: degrees(a.rotation) });
           });
         } else if (a.type === "image") {
           const [x, y] = vp.convertToPdfPoint(vx, vy + a.h);
@@ -1156,10 +1460,9 @@ function setTool(name) {
   if (name !== "select") colorInput.value = toolColors[colorSlot(name)];
   overlay.style.cursor = "";
   for (const button of toolButtons) button.setAttribute("aria-pressed", String(button.dataset.tool === name));
-  if (name !== "select") {
-    selectedId = null;
-    drawOverlay();
-  }
+  hoverBlock = null;
+  if (name !== "select") selectedId = null;
+  drawOverlay();
   updateControls();
 }
 

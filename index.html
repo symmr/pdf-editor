@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PDF Editor</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600&display=swap">
+  <style>
+    /* Same palette and components as Translation Supporter
+       (cool neutrals with one electric indigo accent). */
+    :root {
+      color-scheme: light dark;
+      --bg: #fbfcfd;
+      --surface: #fff;
+      --tint: #f1f2f3;
+      --border: oklch(0.91 0.004 250);
+      --border-strong: oklch(0.82 0.006 250);
+      --text: oklch(0.18 0.005 250);
+      --muted: oklch(0.45 0.005 250);
+      --accent: rgb(38, 1, 253);
+      --accent-hover: rgb(29, 0, 205);
+      --accent-ink: rgb(0, 17, 101);
+      --on-accent: #fff;
+      --drop: oklch(0.96 0.03 268);
+      --ok-bg: oklch(0.96 0.03 160);
+      --ok-text: oklch(0.38 0.09 160);
+      --warn-bg: oklch(0.97 0.04 85);
+      --warn-text: oklch(0.42 0.09 70);
+      --err-bg: oklch(0.96 0.03 25);
+      --err-text: oklch(0.45 0.16 25);
+      --stage: oklch(0.94 0.004 250);
+      --shadow-1: 0 1px 3px oklch(0 0 0 / 0.08);
+      --shadow-2: 0 1px 3px oklch(0 0 0 / 0.08), 0 4px 12px oklch(0 0 0 / 0.06);
+      --glow: 0 1px 3px rgba(38, 1, 253, 0.3);
+      --r-sm: 4px;
+      --r-md: 6px;
+      --r-pill: 18px;
+      --mono: "Geist Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: oklch(0.15 0.005 250);
+        --surface: oklch(0.19 0.005 250);
+        --tint: oklch(0.23 0.005 250);
+        --border: oklch(0.28 0.006 250);
+        --border-strong: oklch(0.36 0.008 250);
+        --text: oklch(0.96 0.003 250);
+        --muted: oklch(0.70 0.006 250);
+        --accent: oklch(0.62 0.23 268);
+        --accent-hover: oklch(0.70 0.19 268);
+        --accent-ink: oklch(0.82 0.10 268);
+        --on-accent: #fff;
+        --drop: oklch(0.25 0.07 268);
+        --ok-bg: oklch(0.26 0.05 160);
+        --ok-text: oklch(0.85 0.10 160);
+        --warn-bg: oklch(0.27 0.05 75);
+        --warn-text: oklch(0.88 0.10 85);
+        --err-bg: oklch(0.27 0.06 25);
+        --err-text: oklch(0.86 0.08 25);
+        --stage: oklch(0.12 0.005 250);
+        --shadow-1: 0 1px 3px oklch(0 0 0 / 0.4);
+        --shadow-2: 0 1px 3px oklch(0 0 0 / 0.4), 0 4px 12px oklch(0 0 0 / 0.3);
+        --glow: 0 1px 3px oklch(0.62 0.23 268 / 0.4);
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "Geist", "Noto Sans JP", system-ui, -apple-system, sans-serif;
+      font-size: 15px;
+      -webkit-font-smoothing: antialiased;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.625;
+    }
+    main {
+      max-width: 1240px;
+      margin: 0 auto;
+      /* bottom padding keeps the fixed message area from covering content */
+      padding: 3.5rem 1.25rem 8rem;
+    }
+    h1 { font-size: 2.25rem; font-weight: 600; line-height: 1.15; letter-spacing: -0.8px; margin: 0 0 1rem; }
+    h1, h2 { font-feature-settings: "palt"; }
+    @media (max-width: 768px) {
+      main { padding-top: 2rem; }
+      .step { padding: 1.1rem 1rem 1.2rem; }
+      h1 { font-size: 1.75rem; letter-spacing: -0.5px; }
+    }
+    .lede { margin: 0 0 2.5rem; }
+    .flow {
+      list-style: none;
+      counter-reset: flow;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin: 0 0 0.75rem;
+      padding: 0;
+      font-size: 0.875rem;
+    }
+    .flow li {
+      counter-increment: flow;
+      display: flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.2rem 0.75rem 0.2rem 0.6rem;
+      border-radius: var(--r-pill);
+      background: var(--tint);
+    }
+    .flow li::before {
+      content: counter(flow, decimal-leading-zero);
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--accent);
+    }
+    .note {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+    .note svg { flex: 0 0 auto; width: 1rem; height: 1rem; }
+    .step {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      box-shadow: var(--shadow-2);
+      padding: 1.5rem 1.5rem 1.6rem;
+      margin-bottom: 1.25rem;
+    }
+    .step[hidden] { display: none; }
+    .step-head {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      margin-bottom: 1.1rem;
+    }
+    .step-num {
+      flex: 0 0 auto;
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--accent);
+    }
+    .step.is-done .step-num { color: var(--muted); }
+    .step h2 {
+      margin: 0;
+      font-size: 1.25rem;
+      font-weight: 500;
+      line-height: 1.3;
+      letter-spacing: -0.4px;
+    }
+    .step-head .meta { margin: 0 0 0 auto; }
+    .dropzone {
+      border: 1px dashed var(--border-strong);
+      border-radius: var(--r-md);
+      padding: 1.75rem 1rem;
+      text-align: center;
+      background: var(--tint);
+      cursor: pointer;
+    }
+    .dropzone:hover,
+    .dropzone.is-drag {
+      border-color: var(--accent);
+      background: var(--drop);
+    }
+    body.is-busy .dropzone {
+      opacity: 0.45;
+      pointer-events: none;
+    }
+    .dropzone strong { color: var(--text); font-size: 1rem; font-weight: 500; }
+    .dropzone p { margin: 0.2rem 0 0; color: var(--muted); font-family: var(--mono); font-size: 0.8rem; }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+      margin-top: 0.85rem;
+    }
+    button, .btn {
+      appearance: none;
+      border: 1px solid var(--border-strong);
+      background: transparent;
+      color: var(--muted);
+      border-radius: var(--r-md);
+      padding: 0.45rem 0.85rem;
+      font: inherit;
+      font-size: 0.875rem;
+      font-weight: 500;
+      line-height: 1.4;
+      cursor: pointer;
+      transition: color 0.12s, border-color 0.12s, background 0.12s;
+    }
+    @media (hover: hover) {
+      button:hover, .btn:hover { color: var(--accent); border-color: var(--accent); }
+    }
+    button.primary, .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: var(--on-accent);
+      box-shadow: var(--glow);
+    }
+    @media (hover: hover) {
+      button.primary:hover, .btn.primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--on-accent); }
+    }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .meta {
+      margin: 0.75rem 0 0;
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+    .hint { color: var(--muted); font-size: 0.8rem; font-weight: normal; }
+
+    /* --- editor ------------------------------------------------------- */
+    .toolbar {
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 1rem;
+      margin: -0.25rem -0.25rem 1rem;
+      padding: 0.5rem 0.25rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+    }
+    .tool-group { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; }
+    .segmented {
+      display: inline-flex;
+      flex-wrap: wrap;
+      padding: 2px;
+      gap: 2px;
+      border-radius: var(--r-md);
+      background: var(--tint);
+    }
+    .segmented button {
+      border-color: transparent;
+      padding: 0.35rem 0.7rem;
+    }
+    .segmented button[aria-pressed="true"] {
+      background: var(--surface);
+      color: var(--accent);
+      border-color: var(--border);
+      box-shadow: var(--shadow-1);
+    }
+    .field {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.8rem;
+      font-weight: 500;
+      color: var(--muted);
+    }
+    .field input[type="number"] {
+      width: 4.2rem;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--r-sm);
+      padding: 0.35rem 0.45rem;
+      font: inherit;
+      font-family: var(--mono);
+      font-size: 0.85rem;
+      background: var(--surface);
+      color: var(--text);
+    }
+    .field input[type="color"] {
+      width: 2.1rem;
+      height: 2.1rem;
+      padding: 2px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--r-sm);
+      background: var(--surface);
+      cursor: pointer;
+    }
+    .tool-group .label {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      color: var(--muted);
+      min-width: 3.4rem;
+      text-align: center;
+    }
+    .push-right { margin-left: auto; }
+    .editor {
+      user-select: none;
+      -webkit-user-select: none;
+      display: grid;
+      grid-template-columns: 9.5rem minmax(0, 1fr);
+      gap: 1rem;
+    }
+    @media (max-width: 768px) {
+      .editor { grid-template-columns: minmax(0, 1fr); }
+      .thumbs { flex-direction: row; max-height: none; overflow-x: auto; order: 2; }
+      .thumb { flex: 0 0 7rem; }
+    }
+    .thumbs {
+      display: flex;
+      flex-direction: column;
+      gap: 0.6rem;
+      max-height: 78vh;
+      overflow-y: auto;
+      padding: 2px;
+    }
+    .thumb {
+      position: relative;
+      padding: 0.35rem;
+      border: 1px solid var(--border);
+      border-radius: var(--r-md);
+      background: var(--surface);
+      cursor: pointer;
+    }
+    .thumb.is-current { border-color: var(--accent); box-shadow: var(--glow); }
+    .thumb.is-drop-before { box-shadow: 0 -3px 0 var(--accent); }
+    .thumb.is-drop-after { box-shadow: 0 3px 0 var(--accent); }
+    .thumb canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #fff;
+      box-shadow: var(--shadow-1);
+    }
+    .thumb-foot {
+      display: flex;
+      align-items: center;
+      gap: 0.15rem;
+      margin-top: 0.3rem;
+    }
+    .thumb-num {
+      flex: 1;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .thumb-foot button {
+      padding: 0 0.3rem;
+      border-color: transparent;
+      font-size: 0.85rem;
+      line-height: 1.5;
+    }
+    .stage {
+      min-height: 60vh;
+      max-height: 78vh;
+      overflow: auto;
+      border-radius: var(--r-md);
+      background: var(--stage);
+      padding: 1.25rem;
+      display: flex;
+    }
+    .page-wrap {
+      position: relative;
+      margin: auto;
+      flex: 0 0 auto;
+      background: #fff;
+      box-shadow: var(--shadow-2);
+    }
+    .page-wrap canvas { position: absolute; inset: 0; display: block; }
+    #overlay { touch-action: none; }
+    .page-wrap[data-tool="select"] #overlay { cursor: default; }
+    .page-wrap[data-tool="text"] #overlay { cursor: text; }
+    .page-wrap[data-tool="whiteout"] #overlay,
+    .page-wrap[data-tool="highlight"] #overlay,
+    .page-wrap[data-tool="box"] #overlay,
+    .page-wrap[data-tool="pen"] #overlay { cursor: crosshair; }
+    .text-editor {
+      position: absolute;
+      z-index: 2;
+      margin: 0;
+      padding: 0;
+      border: 1px dashed var(--accent);
+      outline: none;
+      background: rgba(255, 255, 255, 0.85);
+      resize: none;
+      overflow: hidden;
+      white-space: pre;
+      user-select: text;
+      -webkit-user-select: text;
+      font-family: "Noto Sans JP", sans-serif;
+    }
+
+    /* Feedback follows the viewport so it stays visible next to whichever
+       step the user is acting on. */
+    .msg-area {
+      position: fixed;
+      left: 50%;
+      bottom: 1rem;
+      transform: translateX(-50%);
+      width: min(880px, calc(100% - 2rem));
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+      z-index: 10;
+      pointer-events: none;
+    }
+    .msg {
+      margin: 0;
+      padding: 0.65rem 0.75rem;
+      border-radius: var(--r-md);
+      font-size: 0.875rem;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-2);
+      pointer-events: auto;
+    }
+    .msg.error { background: var(--err-bg); color: var(--err-text); }
+    .msg.ok { background: var(--ok-bg); color: var(--ok-text); }
+    .msg.busy { background: var(--surface); color: var(--text); }
+    .msg.busy::before {
+      content: "";
+      display: inline-block;
+      width: 0.8rem;
+      height: 0.8rem;
+      margin-right: 0.5rem;
+      vertical-align: -0.05rem;
+      border: 2px solid var(--muted);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      .msg.busy::before { animation: none; }
+    }
+    .disclaimer {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin: 1.25rem 0 0;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>PDF Editor</h1>
+    <ol class="flow">
+      <li>PDF を開く</li>
+      <li>文字の追加・白塗り・ページ整理</li>
+      <li>保存する</li>
+    </ol>
+    <p class="lede note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>ファイルはサーバに送られません</p>
+
+    <section class="step" id="step1">
+      <div class="step-head">
+        <span class="step-num">01</span>
+        <h2>ファイルを置く</h2>
+      </div>
+      <div class="dropzone" id="pdfDrop" tabindex="0" role="button">
+        <strong>ファイルを選択</strong>
+        <p>.pdf</p>
+      </div>
+      <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+      <p class="meta" id="fileMeta" hidden></p>
+    </section>
+
+    <section class="step" id="step2" hidden>
+      <div class="step-head">
+        <span class="step-num">02</span>
+        <h2>修正する</h2>
+        <span class="meta" id="editMeta"></span>
+      </div>
+      <div class="toolbar">
+        <div class="segmented" role="group" aria-label="ツール">
+          <button type="button" data-tool="select" aria-pressed="true" title="選択・移動・サイズ変更 (V)">選択</button>
+          <button type="button" data-tool="text" aria-pressed="false" title="クリックした位置に文字を書く (T)">テキスト</button>
+          <button type="button" data-tool="whiteout" aria-pressed="false" title="ドラッグした範囲を白で塗りつぶす (W)">白塗り</button>
+          <button type="button" data-tool="highlight" aria-pressed="false" title="ドラッグした範囲に色を重ねる (H)">ハイライト</button>
+          <button type="button" data-tool="box" aria-pressed="false" title="ドラッグした範囲を枠で囲む (R)">枠線</button>
+          <button type="button" data-tool="pen" aria-pressed="false" title="手書き (P)">ペン</button>
+          <button type="button" id="imageBtn" title="画像・署名を挿入">画像</button>
+        </div>
+        <input type="file" id="imageInput" accept="image/png,image/jpeg,image/webp,image/gif" hidden>
+        <div class="tool-group">
+          <label class="field" title="色"><input type="color" id="colorInput" value="#d00000"></label>
+          <label class="field">文字 <input type="number" id="sizeInput" value="14" min="4" max="200" step="1"></label>
+          <label class="field">線 <input type="number" id="widthInput" value="2" min="0.5" max="40" step="0.5"></label>
+        </div>
+        <div class="tool-group">
+          <button type="button" id="undoBtn" title="元に戻す (Ctrl+Z)">元に戻す</button>
+          <button type="button" id="redoBtn" title="やり直す (Ctrl+Shift+Z)">やり直す</button>
+          <button type="button" id="deleteBtn" title="選択中の書き込みを削除 (Delete)">削除</button>
+        </div>
+        <div class="tool-group push-right">
+          <button type="button" id="prevBtn" aria-label="前のページ">◀</button>
+          <span class="label" id="pageLabel">– / –</span>
+          <button type="button" id="nextBtn" aria-label="次のページ">▶</button>
+          <button type="button" id="zoomOutBtn" aria-label="縮小">−</button>
+          <span class="label" id="zoomLabel">100%</span>
+          <button type="button" id="zoomInBtn" aria-label="拡大">＋</button>
+        </div>
+      </div>
+      <div class="editor">
+        <div class="thumbs" id="thumbs" aria-label="ページ一覧"></div>
+        <div class="stage" id="stage">
+          <div class="page-wrap" id="pageWrap" data-tool="select">
+            <canvas id="pdfCanvas"></canvas>
+            <canvas id="overlay"></canvas>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <button type="button" id="appendBtn">PDF を後ろに追加</button>
+        <input type="file" id="appendInput" accept="application/pdf,.pdf" multiple hidden>
+        <span class="hint">サムネイルはドラッグで並べ替え。⟲ ⟳ で回転、✕ で削除</span>
+      </div>
+    </section>
+
+    <section class="step" id="step3" hidden>
+      <div class="step-head">
+        <span class="step-num">03</span>
+        <h2>保存する</h2>
+      </div>
+      <div class="row">
+        <button type="button" class="primary" id="downloadBtn">PDF をダウンロード</button>
+        <span class="hint" id="downloadHint"></span>
+      </div>
+    </section>
+
+    <p class="disclaimer">白塗りは見た目を隠すだけで、下の文字は PDF に残ります。機密情報の墨消しには使わないでください。</p>
+  </main>
+  <div class="msg-area" role="status" aria-live="polite">
+    <p class="msg busy" id="busyMsg" hidden></p>
+    <p class="msg error" id="errorMsg" hidden></p>
+    <p class="msg ok" id="okMsg" hidden></p>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

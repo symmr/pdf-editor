@@ -9,12 +9,12 @@ UI は [Translation Supporter](https://github.com/symmr/ppt-translation-supporte
 ビルドは不要。静的ファイルとして配信すれば動く（`file://` で直接開くと pdf.js の読み込みが CORS で止まるので、ローカルサーバを使う）。
 
 ```sh
-cd examples/pdf-editor
+cd pdf-editor
 python3 -m http.server 8000
 # http://localhost:8000/ を開く
 ```
 
-GitHub Pages などにこのフォルダをそのまま置いても動く。
+GitHub Pages（リポジトリのルートを公開）などにそのまま置いても動く。
 
 ## 使い方
 

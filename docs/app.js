@@ -334,7 +334,7 @@ async function openFiles(fileList, append) {
     step3.hidden = false;
     step1.classList.add("is-done");
     fileMeta.hidden = false;
-    fileMeta.textContent = doc.sources.map((s) => s.name).join("、");
+    fileMeta.textContent = doc.sources.map((s) => `${s.name} · ${(s.bytes.length / 1024).toFixed(1)} KB`).join("、");
     if (!append) await fitZoom();
     renderAll();
     if (append) showOk(`${doc.pages.length - firstNew} ページを追加しました`);

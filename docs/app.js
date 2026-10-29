@@ -2347,3 +2347,37 @@ updateControls();
     document.getElementById("appVersionLine").hidden = false;
   } catch (_) {}
 })();
+
+(async function showAppNav() {
+  const nav = document.getElementById("appNav");
+  if (!nav) return;
+  try {
+    const res = await fetch("apps.json", { cache: "no-store" });
+    if (!res.ok) return;
+    const apps = await res.json();
+    if (!Array.isArray(apps) || apps.length === 0) return;
+    const currentId = document.documentElement.dataset.app || "";
+    const path = location.pathname.replace(/\/+$/, "");
+    const nodes = [];
+    for (const app of apps) {
+      if (!app || !app.title || !app.url) continue;
+      const current =
+        (app.id && app.id === currentId) ||
+        (app.id && path.endsWith(`/${app.id}`));
+      if (nodes.length) nodes.push(document.createTextNode(" · "));
+      if (current) {
+        const span = document.createElement("span");
+        span.textContent = app.title;
+        nodes.push(span);
+      } else {
+        const a = document.createElement("a");
+        a.href = app.url;
+        a.textContent = app.title;
+        nodes.push(a);
+      }
+    }
+    if (!nodes.length) return;
+    nav.replaceChildren(document.createTextNode("他サービス："), ...nodes);
+    nav.hidden = false;
+  } catch (_) {}
+})();

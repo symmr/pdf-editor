@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="ja" data-app="pdf-editor">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -426,6 +426,15 @@
     }
     .app-version a { color: var(--muted); }
     .app-version a:hover { color: var(--accent); }
+    .app-nav {
+      margin: 1.25rem 0 0;
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-align: center;
+    }
+    .app-nav a { color: var(--muted); }
+    .app-nav a:hover { color: var(--accent); }
+    .app-nav:not([hidden]) + .app-version { margin-top: 0.4rem; }
   </style>
 </head>
 <body>
@@ -509,6 +518,7 @@
     </section>
 
     <p class="disclaimer">ご利用は自己責任でお願いします。</p>
+    <p class="app-nav" id="appNav" hidden></p>
     <p class="app-version" id="appVersionLine" hidden>
       <a href="https://github.com/symmr/pdf-editor/" target="_blank" rel="noopener noreferrer">GitHub</a>
       · <span id="appVersion"></span>

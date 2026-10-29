@@ -7,8 +7,10 @@
 
 const PDFJS_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs";
 const PDFJS_WORKER_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
-const PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js";
-const PDF_LIB_SRI = "sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI";
+// The maintained pdf-lib fork: same API, and it can decrypt, which pdf-lib
+// 1.17 cannot (it copied encrypted streams as they were, garbling the page).
+const PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/@cantoo/pdf-lib@2.11.1/dist/pdf-lib.min.js";
+const PDF_LIB_SRI = "sha384-BcRbGROz3cx4LSKcOw2L5YxAxiJPWIEmXRMrYbXu87aSiU5uMQ4qB9v8FEjrBhhq";
 const FONTKIT_URL = "https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js";
 const FONTKIT_SRI = "sha384-2p6U+1mmqF10USehFeRiyG2ESG9FwIqN+jxULn5w9jjQIihSn9Pt13dVCn/Hawjn";
 // The same family the page loads from Google Fonts, so text looks the same on
@@ -69,7 +71,7 @@ const errorMsg = document.getElementById("errorMsg");
 const okMsg = document.getElementById("okMsg");
 
 const doc = {
-  sources: [], // { name, bytes, pdf }: bytes for pdf-lib, pdf for pdf.js
+  sources: [], // { name, bytes, pdf, restricted }: bytes for pdf-lib, pdf for pdf.js
   pages: [], // { id, src, index, baseRotation, rotation, annots }
   images: new Map(), // key -> { dataUrl, mime }
 };
@@ -90,7 +92,13 @@ let busy = false;
 let nextId = 1;
 let baseName = "document";
 let okTimer = null;
-let savedUndoDepth = 0; // undo depth at the last save, for the leave-page warning
+// Every change gets a new version number and undo/redo bring the old one
+// back, so the leave-page warning knows whether the state on screen is the
+// one last saved (the undo depth cannot tell: undo then a new change, or a
+// full undo stack, keep the same depth).
+let version = 0;
+let lastVersion = 0;
+let savedVersion = 0;
 
 const loads = new Map();
 const thumbCache = new Map(); // "src:index:rotation" -> Promise<canvas>
@@ -216,18 +224,25 @@ function selectedAnnot() {
 
 function snapshot() {
   const page = currentPage();
-  return { pages: structuredClone(doc.pages), currentId: page ? page.id : null };
+  return { pages: structuredClone(doc.pages), currentId: page ? page.id : null, version };
 }
 
 function pushUndo(snap) {
   undoStack.push(snap || snapshot());
   if (undoStack.length > MAX_UNDO) undoStack.shift();
   redoStack = [];
+  version = ++lastVersion;
   updateControls();
+}
+
+// Takes back the step just pushed, when the change it was for did not happen.
+function dropUndo() {
+  version = undoStack.pop().version;
 }
 
 function restore(snap) {
   doc.pages = snap.pages;
+  version = snap.version;
   const index = doc.pages.findIndex((p) => p.id === snap.currentId);
   current = index >= 0 ? index : Math.min(current, doc.pages.length - 1);
   selectedId = null;
@@ -274,7 +289,10 @@ async function openFiles(fileList, append) {
       try {
         // pdf.js takes ownership of the buffer it is given, so it gets a copy.
         const pdf = await pdfjs.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise;
-        loaded.push({ name: file.name, bytes, pdf });
+        // Opened without a password but encrypted: printing or editing is
+        // restricted. Saving decrypts it, which lifts the restrictions.
+        const restricted = (await pdf.getPermissions()) !== null;
+        loaded.push({ name: file.name, bytes, pdf, restricted });
       } catch (err) {
         throw new Error(err && err.name === "PasswordException"
           ? `${file.name} はパスワード付きのため開けません`
@@ -294,6 +312,7 @@ async function openFiles(fileList, append) {
       libDocs.clear();
       undoStack = [];
       redoStack = [];
+      savedVersion = version;
       selectedId = null;
       baseName = loaded[0].name.replace(/\.pdf$/i, "") || "document";
     }
@@ -795,7 +814,7 @@ function endDrag() {
     if (box.w < 3 || box.h < 3) {
       const annots = currentPage().annots;
       annots.splice(annots.indexOf(annot), 1);
-      undoStack.pop();
+      dropUndo();
     }
   }
   drawOverlay();
@@ -878,7 +897,7 @@ function commitEditor() {
       // the undo step was pushed when the block was taken over
       if (text === existing.text) {
         page.annots.splice(page.annots.indexOf(existing), 1);
-        undoStack.pop();
+        dropUndo();
         selectedId = null;
       } else {
         existing.text = text;
@@ -1111,10 +1130,20 @@ function movePage(from, to) {
 
 const blockKey = (page) => `${page.src}:${page.index}`;
 
+// pdf-lib document of a source, decrypted. The empty password opens what
+// pdf.js opened without one: files that only restrict printing or editing.
+async function loadLibDoc(PDFLib, src) {
+  const { name, bytes } = doc.sources[src];
+  const libDoc = await PDFLib.PDFDocument.load(bytes, { password: "", updateMetadata: false });
+  // An encryption pdf-lib cannot undo leaves it encrypted; copying its
+  // streams as they are would garble the pages.
+  if (libDoc.isEncrypted) throw new Error(`${name} の暗号化を解除できませんでした`);
+  return libDoc;
+}
+
 function libDocOf(src) {
   if (!libDocs.has(src)) {
-    const promise = loadPdfLib().then(({ PDFLib }) =>
-      PDFLib.PDFDocument.load(doc.sources[src].bytes, { ignoreEncryption: true, updateMetadata: false }));
+    const promise = loadPdfLib().then(({ PDFLib }) => loadLibDoc(PDFLib, src));
     libDocs.set(src, promise);
     promise.catch(() => libDocs.delete(src));
   }
@@ -1135,7 +1164,7 @@ function loadBlocks(page) {
       try {
         const { PDFLib } = await loadPdfLib();
         const libDoc = await libDocOf(page.src);
-        if (!libDoc.isEncrypted) segments = collectPageSegments(PDFLib, libDoc.getPage(page.index), new Map());
+        segments = collectPageSegments(PDFLib, libDoc.getPage(page.index), new Map());
       } catch (_) {
         segments = [];
       }
@@ -1328,20 +1357,83 @@ function hexToRgb(rgb, hex) {
   return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
 }
 
+// Puts the document's pages in this order. The tree is rebuilt flat with
+// the pages' inherited attributes moved onto them, as pdf-lib's removePage
+// would delete the page objects that are reused here. The original pages left
+// out are deleted: bookmarks and form fields that point at them would
+// otherwise keep their content in the file.
+function setPageOrder(PDFLib, out, pages, original) {
+  const { PDFName, PDFNumber, PDFPageLeaf } = PDFLib;
+  for (const pg of pages) {
+    for (const key of PDFPageLeaf.InheritableEntries) {
+      const name = PDFName.of(key);
+      const value = pg.node.getInheritableAttribute(name);
+      if (value && !pg.node.get(name)) pg.node.set(name, value);
+    }
+  }
+  const rootRef = out.catalog.get(PDFName.of("Pages"));
+  for (const pg of pages) pg.node.setParent(rootRef);
+  const root = out.catalog.Pages();
+  root.set(PDFName.of("Kids"), out.context.obj(pages.map((pg) => pg.ref)));
+  root.set(PDFName.of("Count"), PDFNumber.of(pages.length));
+  const kept = new Set(pages);
+  for (const pg of original) if (!kept.has(pg)) out.context.delete(pg.ref);
+  // pdf-lib caches the page list and count
+  out.pageCount = pages.length;
+  out.pageCache.invalidate();
+}
+
+// Leaves out of the file the objects nothing refers to any more: the content
+// streams removePageText replaced (they still hold the original text) and the
+// page tree setPageOrder replaced. Fonts and images are embedded by save(),
+// after this.
+function dropUnreachable(PDFLib, out) {
+  const { PDFRef, PDFDict, PDFArray, PDFStream } = PDFLib;
+  const { context } = out;
+  const seen = new Set();
+  const stack = [context.trailerInfo.Root, context.trailerInfo.Info];
+  while (stack.length) {
+    let obj = stack.pop();
+    if (obj instanceof PDFRef) {
+      if (seen.has(obj)) continue;
+      seen.add(obj);
+      obj = context.lookup(obj);
+    }
+    if (obj instanceof PDFStream) obj = obj.dict;
+    if (obj instanceof PDFDict) {
+      for (const [, value] of obj.entries()) stack.push(value);
+    } else if (obj instanceof PDFArray) {
+      stack.push(...obj.asArray());
+    }
+  }
+  for (const [ref] of context.enumerateIndirectObjects()) {
+    if (!seen.has(ref)) context.delete(ref);
+  }
+}
+
 async function buildPdf(PDFLib, fontkit) {
-  const { PDFDocument, rgb, degrees, BlendMode, LineCapStyle } = PDFLib;
-  const out = await PDFDocument.create();
+  const { rgb, degrees, BlendMode, LineCapStyle } = PDFLib;
+  // The first file is edited in place rather than copied page by page into a
+  // new document, so what belongs to the whole document (form fields,
+  // bookmarks, links between pages, metadata) stays.
+  const out = await loadLibDoc(PDFLib, 0);
   out.registerFontkit(fontkit);
+  const original = out.getPages();
 
   // One copyPages call per source keeps resources shared between its pages.
   const copied = new Map();
   for (let src = 0; src < doc.sources.length; src++) {
     const pages = doc.pages.filter((p) => p.src === src);
     if (!pages.length) continue;
-    const source = await PDFDocument.load(doc.sources[src].bytes, { ignoreEncryption: true });
+    if (src === 0) {
+      pages.forEach((p) => copied.set(p.id, original[p.index]));
+      continue;
+    }
+    const source = await loadLibDoc(PDFLib, src);
     const copies = await out.copyPages(source, pages.map((p) => p.index));
     pages.forEach((p, i) => copied.set(p.id, copies[i]));
   }
+  setPageOrder(PDFLib, out, doc.pages.map((p) => copied.get(p.id)), original);
 
   const texts = doc.pages.flatMap((p) => p.annots.filter((a) => a.type === "text" && a.text));
   const fonts = {}; // keyed by bold
@@ -1368,7 +1460,6 @@ async function buildPdf(PDFLib, fontkit) {
 
   for (const page of doc.pages) {
     const pg = copied.get(page.id);
-    out.addPage(pg);
     pg.setRotation(degrees(rotationOf(page)));
     const pdfPage = await pdfPageOf(page);
     // Edited blocks: take the original strings out of the page content
@@ -1423,6 +1514,8 @@ async function buildPdf(PDFLib, fontkit) {
       }
     }
   }
+  out.setModificationDate(new Date());
+  dropUnreachable(PDFLib, out);
   return out.save();
 }
 
@@ -1460,8 +1553,10 @@ async function download() {
     const bytes = await buildPdf(PDFLib, fontkit);
     const filename = `${baseName}_edited.pdf`;
     if (!(await saveFile(filename, new Blob([bytes], { type: "application/pdf" })))) return;
-    savedUndoDepth = undoStack.length;
-    showOk(`${filename} を保存しました`);
+    savedVersion = version;
+    showOk(doc.sources.some((s) => s.restricted)
+      ? `${filename} を保存しました。元の PDF にあった印刷・編集の制限は外れています`
+      : `${filename} を保存しました`);
   } catch (err) {
     showError(`保存できませんでした: ${err.message || err}`);
   } finally {
@@ -1607,7 +1702,7 @@ document.addEventListener("drop", (event) => {
 });
 
 window.addEventListener("beforeunload", (event) => {
-  if (undoStack.length !== savedUndoDepth) event.preventDefault();
+  if (version !== savedVersion) event.preventDefault();
 });
 
 updateControls();

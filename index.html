@@ -7,7 +7,7 @@
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600;700&family=Noto+Serif+JP:wght@400;700&display=swap">
   <style>
     /* Same palette and components as Translation Supporter
        (cool neutrals with one electric indigo accent). */
@@ -271,6 +271,15 @@
       background: var(--surface);
       color: var(--text);
     }
+    .field select {
+      border: 1px solid var(--border-strong);
+      border-radius: var(--r-sm);
+      padding: 0.35rem 0.45rem;
+      font: inherit;
+      font-size: 0.85rem;
+      background: var(--surface);
+      color: var(--text);
+    }
     .field input[type="color"] {
       width: 2.1rem;
       height: 2.1rem;
@@ -480,6 +489,10 @@
         <div class="tool-group">
           <label class="field" title="色"><input type="color" id="colorInput" value="#d00000"></label>
           <label class="field">文字 <input type="number" id="sizeInput" value="14" min="4" max="200" step="0.5"></label>
+          <label class="field" title="書体（「文字を編集」では元の文字に合わせて選ばれる）"><select id="fontInput" aria-label="書体">
+            <option value="sans">ゴシック</option>
+            <option value="serif">明朝</option>
+          </select></label>
           <button type="button" id="boldBtn" class="bold-btn" aria-pressed="false" title="太字" aria-label="太字">B</button>
           <label class="field">線 <input type="number" id="widthInput" value="2" min="0.5" max="40" step="0.5"></label>
         </div>

@@ -90,15 +90,16 @@
       h1 { font-size: 1.75rem; letter-spacing: -0.5px; }
     }
     .page-header { margin-bottom: 1.5rem; }
-    .lede { margin: 0; font-size: 14px; line-height: 22.75px; }
+    .lead { margin: 0 0 0.4rem; font-size: 14px; line-height: 22.75px; }
     .note {
       display: flex;
       align-items: center;
       gap: 0.4rem;
+      margin: 0;
       color: var(--muted);
-      font-size: 0.9rem;
+      font-size: 14px;
+      line-height: 22.75px;
     }
-    .lede.note { font-size: 14px; line-height: 22.75px; }
     .note svg { flex: 0 0 auto; width: 1rem; height: 1rem; }
     .step {
       background: var(--surface);
@@ -431,7 +432,8 @@
   <main>
     <header class="page-header">
       <h1>PDF Editor</h1>
-      <p class="lede note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>ファイルはサーバに送られません</p>
+      <p class="lead">PDFを編集できます</p>
+      <p class="note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>ファイルはサーバに送られません</p>
     </header>
     <section class="step" id="step1">
       <div class="dropzone" id="pdfDrop" tabindex="0" role="button">

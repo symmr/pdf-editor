@@ -11,8 +11,10 @@ const PDFJS_WORKER_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/
 // 1.17 cannot (it copied encrypted streams as they were, garbling the page).
 const PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/@cantoo/pdf-lib@2.11.1/dist/pdf-lib.min.js";
 const PDF_LIB_SRI = "sha384-BcRbGROz3cx4LSKcOw2L5YxAxiJPWIEmXRMrYbXu87aSiU5uMQ4qB9v8FEjrBhhq";
-const FONTKIT_URL = "https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js";
-const FONTKIT_SRI = "sha384-2p6U+1mmqF10USehFeRiyG2ESG9FwIqN+jxULn5w9jjQIihSn9Pt13dVCn/Hawjn";
+// The fontkit fork the pdf-lib fork is written for. With @pdf-lib/fontkit the
+// fork's subset call fails ("reading 'pos'") when saving any added text.
+const FONTKIT_URL = "https://cdn.jsdelivr.net/npm/@cantoo/fontkit@2.0.12/dist/fontkit.umd.min.js";
+const FONTKIT_SRI = "sha384-5amnpiVitOi3dI0QSR7Gg6X10VnzSww9bE/+GZ0ngGWcglIrBP0CzTlvOMbR97Gc";
 // Typefaces text is written in. The fonts in a PDF usually hold only the
 // glyphs it uses, so edited text cannot keep its own font; it gets the one
 // of these that looks like it (guessFont). Each is the family the page loads
@@ -34,7 +36,16 @@ const FONTS = {
     mid: 0.4325,
   },
 };
-const fontOf = (a) => FONTS[a.font] || FONTS.sans;
+// Fonts installed on this computer, matched to the names of the fonts a PDF
+// draws its text in (Local Font Access API: Chromium browsers, after the
+// user allows it). Edited text can then keep its own font. Entries are keyed
+// "local:<PostScript name>" and look like FONTS entries; fallback is the
+// FONTS key used when the font cannot be embedded or lacks a character.
+const localFonts = new Map();
+let localList = null; // FontData[] once allowed, [] when not
+let localReady = null; // promise of localList
+
+const fontOf = (a) => FONTS[a.font] || localFonts.get(a.font) || FONTS.sans;
 
 // Text boxes are laid out from their top-left corner: line i has its baseline
 // at (i * lineHeight + baselineOffset(lineHeight, a)) * size. With the font's
@@ -47,10 +58,10 @@ const ZOOM_STEPS = [0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 const THUMB_WIDTH = 132;
 const HANDLE_SIZE = 9;
 const MAX_UNDO = 100;
-const TOOL_KEYS = { v: "select", e: "edit", t: "text", w: "whiteout", h: "highlight", r: "box", p: "pen" };
+const TOOL_KEYS = { v: "select", e: "edit", t: "text", f: "fill", h: "highlight", r: "box", p: "pen" };
 // Highlights keep their own color so switching tools does not turn them red.
-const toolColors = { highlight: "#ffd400", other: "#d00000" };
-const colorSlot = (name) => (name === "highlight" ? "highlight" : "other");
+const toolColors = { highlight: "#ffd400", fill: "#ffffff", other: "#d00000" };
+const colorSlot = (name) => (name === "highlight" || name === "fill" ? name : "other");
 
 const pdfDrop = document.getElementById("pdfDrop");
 const fileInput = document.getElementById("fileInput");
@@ -58,7 +69,6 @@ const fileMeta = document.getElementById("fileMeta");
 const step1 = document.getElementById("step1");
 const step2 = document.getElementById("step2");
 const step3 = document.getElementById("step3");
-const editMeta = document.getElementById("editMeta");
 const toolButtons = [...document.querySelectorAll("[data-tool]")].filter((el) => el.tagName === "BUTTON");
 const imageBtn = document.getElementById("imageBtn");
 const imageInput = document.getElementById("imageInput");
@@ -84,7 +94,6 @@ const overlay = document.getElementById("overlay");
 const appendBtn = document.getElementById("appendBtn");
 const appendInput = document.getElementById("appendInput");
 const downloadBtn = document.getElementById("downloadBtn");
-const downloadHint = document.getElementById("downloadHint");
 const busyMsg = document.getElementById("busyMsg");
 const errorMsg = document.getElementById("errorMsg");
 const okMsg = document.getElementById("okMsg");
@@ -203,32 +212,7 @@ function loadFont(url) {
   });
 }
 
-// @pdf-lib/fontkit writes a short-format loca table for small subsets but
-// does not pad glyphs to an even length, so every glyph after an odd-length
-// one points at the wrong bytes and renders blank. Padding fixes the offsets.
-// (Same fix as Translation Supporter's pdf-text.js.)
-const patchedFontkits = new WeakSet();
 
-function patchFontkitSubset(fontkit, fontBytes) {
-  if (patchedFontkits.has(fontkit)) return;
-  patchedFontkits.add(fontkit);
-  const proto = Object.getPrototypeOf(fontkit.create(fontBytes).createSubset());
-  if (!proto || typeof proto._addGlyph !== "function" || proto._addGlyphEvenPadded) return;
-  const addGlyph = proto._addGlyph;
-  proto._addGlyph = function addEvenGlyph(gid) {
-    const index = addGlyph.call(this, gid);
-    const buf = this.glyf && this.glyf[index];
-    if (buf && buf.length % 2) {
-      const Ctor = buf.constructor;
-      const padded = Ctor && typeof Ctor.alloc === "function" ? Ctor.alloc(buf.length + 1) : new Uint8Array(buf.length + 1);
-      padded.set(buf);
-      this.glyf[index] = padded;
-      this.offset += 1;
-    }
-    return index;
-  };
-  proto._addGlyphEvenPadded = true;
-}
 
 // --- document state -------------------------------------------------------------
 
@@ -282,10 +266,6 @@ function redo() {
   restore(redoStack.pop());
 }
 
-function annotCount() {
-  return doc.pages.reduce((n, p) => n + p.annots.length, 0);
-}
-
 // --- opening files --------------------------------------------------------------
 
 const isPdf = (file) => file.type === "application/pdf" || /\.pdf$/i.test(file.name);
@@ -327,6 +307,12 @@ async function openFiles(fileList, append) {
       doc.images.clear();
       thumbCache.clear();
       pageBlocks.clear();
+      for (const s of stripped.values()) s.pdf.destroy();
+      stripped.clear();
+      strippedWanted.clear();
+      if (guess) guess.pdf.destroy();
+      guess = null;
+      guessWanted = "";
       loadedBlocks.clear();
       libDocs.clear();
       undoStack = [];
@@ -388,8 +374,44 @@ async function renderPage() {
   if (seq !== renderSeq) return;
   const rotation = rotationOf(page);
   const vp = pdfPage.getViewport({ scale: zoom, rotation });
-  view = { pageId: page.id, pdfPage, vp, rotation };
+  const bare = strippedFor(page);
   const dpr = window.devicePixelRatio || 1;
+  if (view && view.pageId === page.id) view.target = bare;
+  const width = Math.floor(vp.width * dpr);
+  const height = Math.floor(vp.height * dpr);
+  // Drawing the same page again (its text was stripped): render aside and
+  // swap, as resizing the canvas would blank it for a moment.
+  if (view && view.pageId === page.id && view.rotation === rotation && view.vp.scale === vp.scale &&
+      pdfCanvas.width === width && pdfCanvas.height === height) {
+    if (bare && bare.canvas && bare.scale === vp.scale && bare.canvas.width === width && bare.canvas.height === height) {
+      pdfCanvas.getContext("2d").drawImage(bare.canvas, 0, 0);
+      view.stripped = bare;
+      drawOverlay();
+      return;
+    }
+    const aside = document.createElement("canvas");
+    aside.width = width;
+    aside.height = height;
+    const task = (bare ? bare.pdfPage : pdfPage).render({
+      canvasContext: aside.getContext("2d"),
+      viewport: vp,
+      transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
+    });
+    renderTask = task;
+    try {
+      await task.promise;
+      if (seq === renderSeq) {
+        pdfCanvas.getContext("2d").drawImage(aside, 0, 0);
+        view.stripped = bare;
+        drawOverlay();
+      }
+    } catch (err) {
+      if (!err || err.name !== "RenderingCancelledException") showError("ページを表示できませんでした");
+    }
+    if (renderTask === task) renderTask = null;
+    return;
+  }
+  view = { pageId: page.id, pdfPage, vp, rotation, stripped: null, target: bare };
   pageWrap.style.width = `${Math.floor(vp.width)}px`;
   pageWrap.style.height = `${Math.floor(vp.height)}px`;
   for (const canvas of [pdfCanvas, overlay]) {
@@ -399,7 +421,7 @@ async function renderPage() {
     canvas.style.height = `${Math.floor(vp.height)}px`;
   }
   drawOverlay();
-  const task = pdfPage.render({
+  const task = (bare ? bare.pdfPage : pdfPage).render({
     canvasContext: pdfCanvas.getContext("2d"),
     viewport: vp,
     transform: dpr !== 1 ? [dpr, 0, 0, dpr, 0, 0] : undefined,
@@ -407,10 +429,145 @@ async function renderPage() {
   renderTask = task;
   try {
     await task.promise;
+    if (bare && seq === renderSeq) {
+      view.stripped = bare;
+      drawOverlay();
+    }
   } catch (err) {
     if (!err || err.name !== "RenderingCancelledException") showError("ページを表示できませんでした");
   }
   if (renderTask === task) renderTask = null;
+}
+
+// --- the page without the text being edited -------------------------------------------------
+// Saving takes an edited block's original text out of the page content, so
+// nothing needs painting over it. To show the same on screen, a one-page copy
+// of the page is rewritten the same way and rendered instead of the original.
+
+const stripped = new Map(); // page id -> { sig, entries: Map(block -> json), done: Set(block), pdf, pdfPage }
+const strippedWanted = new Map(); // page id -> sig being built (or built last)
+let guess = null; // built ahead for the block under the pointer: { pageId, sig, ... }
+let guessWanted = "";
+
+const editsOf = (page) => page.annots.filter((a) => a.type === "text" && a.replaces);
+const replacesJson = (r) => JSON.stringify({ ...r, fill: undefined });
+const sigOf = (list) => JSON.stringify([...list].sort((p, q) => p.block - q.block).map((r) => [r.block, replacesJson(r)]));
+const originalOf = (block) => ({ block: block.index, x: block.x, y: block.y, w: block.w, h: block.h, size: block.size });
+
+// The stripped page, while it still matches the page's edits (it may have
+// been made for fewer of them).
+function strippedFor(page) {
+  const s = stripped.get(page.id);
+  if (!s || !s.entries.size) return null;
+  const edits = editsOf(page);
+  const ok = [...s.entries].every(([block, json]) => edits.some((a) => a.replaces.block === block && replacesJson(a.replaces) === json));
+  return ok ? s : null;
+}
+
+function useStripped(page, made) {
+  const old = stripped.get(page.id);
+  stripped.set(page.id, made);
+  if (old) old.pdf.destroy();
+  if (currentPage() && currentPage().id === page.id) renderPage();
+}
+
+function ensureStripped(page) {
+  // The page on screen was drawn for other edits (one was undone, or taken
+  // back by leaving its text as it was): draw it again.
+  if (viewReady() && view.target !== strippedFor(page)) renderPage();
+  const edits = editsOf(page);
+  if (!edits.length) return;
+  const sig = sigOf(edits.map((a) => a.replaces));
+  const s = stripped.get(page.id);
+  if ((s && s.sig === sig) || strippedWanted.get(page.id) === sig) return;
+  if (guess && guess.pageId === page.id && guess.sig === sig) {
+    // built ahead while the pointer was over the block
+    strippedWanted.set(page.id, sig);
+    const made = guess;
+    guess = null;
+    useStripped(page, made);
+    return;
+  }
+  strippedWanted.set(page.id, sig);
+  buildStripped(page, edits.map((a) => a.replaces)).then((made) => {
+    if (strippedWanted.get(page.id) !== sig) {
+      made.pdf.destroy();
+      return;
+    }
+    useStripped(page, made);
+  }, () => {}); // the cover stays
+}
+
+// The size the page on screen is drawn at, for rendering ahead.
+function aheadView() {
+  if (!viewReady()) return null;
+  const dpr = window.devicePixelRatio || 1;
+  return { vp: view.vp, dpr, width: Math.floor(view.vp.width * dpr), height: Math.floor(view.vp.height * dpr) };
+}
+// Builds the stripped page for the edits plus the block under the pointer,
+// so that opening it for editing finds the page ready.
+let guessTimer = 0;
+function guessStripped(block) {
+  clearTimeout(guessTimer);
+  if (!block) return;
+  guessTimer = setTimeout(() => {
+    const page = currentPage();
+    if (!page || tool !== "edit") return;
+    const list = editsOf(page).map((a) => a.replaces);
+    if (list.some((r) => r.block === block.index)) return;
+    list.push(originalOf(block));
+    const sig = sigOf(list);
+    if (guessWanted === `${page.id}:${sig}`) return;
+    guessWanted = `${page.id}:${sig}`;
+    buildStripped(page, list, aheadView()).then((made) => {
+      if (guessWanted !== `${page.id}:${sig}`) {
+        made.pdf.destroy();
+        return;
+      }
+      if (strippedWanted.get(page.id) === sig) { // opened meanwhile: that build serves
+        made.pdf.destroy();
+        return;
+      }
+      if (guess) guess.pdf.destroy();
+      guess = { pageId: page.id, ...made };
+    }, () => {});
+  }, 120);
+}
+
+async function buildStripped(page, list, ahead) {
+  const [{ PDFLib }, pdfjs, libDoc] = await Promise.all([loadPdfLib(), loadPdfjs(), libDocOf(page.src)]);
+  const tmp = await PDFLib.PDFDocument.create();
+  const [copy] = await tmp.copyPages(libDoc, [page.index]);
+  tmp.addPage(copy);
+  const { done } = removePageText(PDFLib, copy, list.map((r) => ({ id: r.block, ...r })), [], new Map());
+  const bytes = await tmp.save();
+  const pdf = await pdfjs.getDocument({ data: bytes, isEvalSupported: false }).promise;
+  const pdfPage = await pdf.getPage(1);
+  const original = await pdfPageOf(page);
+  const same = pdfPage.view.every((v, i) => Math.abs(v - original.view[i]) < 0.01);
+  // Rendering is the slow part: for a page built ahead it is done here too,
+  // at the size on screen.
+  let canvas = null;
+  if (ahead && same) {
+    canvas = document.createElement("canvas");
+    canvas.width = ahead.width;
+    canvas.height = ahead.height;
+    await pdfPage.render({
+      canvasContext: canvas.getContext("2d"),
+      viewport: ahead.vp,
+      transform: ahead.dpr !== 1 ? [ahead.dpr, 0, 0, ahead.dpr, 0, 0] : undefined,
+    }).promise;
+  }
+  // Different page boxes would shift everything: keep the cover.
+  return {
+    sig: sigOf(list),
+    entries: same ? new Map(list.map((r) => [r.block, replacesJson(r)])) : new Map(),
+    done,
+    pdf,
+    pdfPage,
+    canvas,
+    scale: ahead ? ahead.vp.scale : 0,
+  };
 }
 
 function viewReady() {
@@ -425,7 +582,20 @@ function drawOverlay() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, overlay.width, overlay.height);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  drawAnnots(ctx, currentPage().annots, view.vp, view.rotation, editing && editing.annotId);
+  const page = currentPage();
+  ensureStripped(page);
+  // Blocks whose text the page on screen no longer has need no cover.
+  let bare = view.stripped && strippedFor(page) === view.stripped ? view.stripped.done : null;
+  // A block just opened for editing still reads as the original text, which
+  // is on the page already: a cover would only flash until the stripped page
+  // arrives.
+  const open = editing && page.annots.find((a) => a.id === editing.annotId);
+  if (open && open.replaces) {
+    const blocks = loadedBlocks.get(blockKey(page));
+    const block = blocks && blocks.find((b) => b.index === open.replaces.block);
+    if (block && block.text === open.text) bare = new Set([...(bare || []), open.replaces.block]);
+  }
+  drawAnnots(ctx, page.annots, view.vp, view.rotation, editing && editing.annotId, bare);
   if (tool === "edit") {
     loadBlocks(currentPage());
     drawBlockOutlines(ctx);
@@ -436,10 +606,11 @@ function drawOverlay() {
 
 // Edited text first hides the original: a cover in the background color
 // sampled around it. Saving removes the original from the page content
-// instead (see buildPdf), so the cover is only a preview.
-function drawAnnots(ctx, annots, vp, rotation, skipId) {
+// instead (see buildPdf), so the cover is only a preview, and only for text
+// the page on screen still has (bare: ids of blocks it no longer has).
+function drawAnnots(ctx, annots, vp, rotation, skipId, bare) {
   for (const a of annots) {
-    if (a.type !== "text" || !a.replaces) continue;
+    if (a.type !== "text" || !a.replaces || (bare && bare.has(a.replaces.block))) continue;
     const r = viewRect(coverRect(a.replaces), vp);
     ctx.fillStyle = a.replaces.fill;
     ctx.fillRect(r.x, r.y, r.w, r.h);
@@ -486,8 +657,8 @@ function drawAnnot(ctx, a, vp, rotation) {
   ctx.save();
   if (a.type === "rect") {
     const r = viewRect(a, vp);
-    if (a.kind === "whiteout") {
-      ctx.fillStyle = "#fff";
+    if (a.kind === "fill") {
+      ctx.fillStyle = a.color;
       ctx.fillRect(r.x, r.y, r.w, r.h);
     } else if (a.kind === "highlight") {
       ctx.globalAlpha = HIGHLIGHT_OPACITY;
@@ -523,8 +694,9 @@ function drawAnnot(ctx, a, vp, rotation) {
       ctx.font = fontSpec(a, a.size * s);
       ctx.fillStyle = a.color;
       ctx.textBaseline = "alphabetic";
-      textLines(a).forEach((line, i) => {
-        ctx.fillText(line, 0, (i * lh + baselineOffset(lh, a)) * a.size * s);
+      const layout = textLayout(a);
+      layout.lines.forEach((line, i) => {
+        ctx.fillText(line, layout.offsets[i] * s, (i * lh + baselineOffset(lh, a)) * a.size * s);
       });
     } else if (a.type === "image") {
       const img = imageElement(a.image);
@@ -616,13 +788,46 @@ function textLines(a) {
   return textLayouts.get(key);
 }
 
-// Size in PDF points of a text box or image, before rotation.
-function localSize(a) {
-  if (a.type === "image") return { w: a.w, h: a.h };
+// Where each line of a text box starts, relative to a.x. Lines are aligned
+// within the box width, else within refWidth (the width the text had before
+// it was edited, so a centered label stays centered whatever it now says),
+// else within the widest line. dx and w are the extent of what is drawn.
+const ALIGN_FACTOR = { left: 0, center: 0.5, right: 1 };
+
+function textLayout(a) {
   const lines = textLines(a);
   const measure = measureAt(a);
-  const w = a.boxWidth || Math.max(...lines.map(measure), a.size * 0.5);
-  return { w, h: Math.max(1, lines.length) * (a.lineHeight || LINE_HEIGHT) * a.size };
+  const widths = lines.map(measure);
+  const f = ALIGN_FACTOR[a.align] || 0;
+  const widest = Math.max(...widths, a.size * 0.5);
+  const within = a.boxWidth || a.refWidth || widest;
+  const offsets = widths.map((w) => (within - w) * f);
+  const h = Math.max(1, lines.length) * (a.lineHeight || LINE_HEIGHT) * a.size;
+  if (a.boxWidth) return { lines, offsets, dx: 0, w: a.boxWidth, h };
+  const dx = Math.min(...offsets);
+  const right = Math.max(...offsets.map((o, i) => o + widths[i]));
+  return { lines, offsets, dx, w: Math.max(right - dx, a.size * 0.5), h };
+}
+
+// Size in PDF points of a text box or image, before rotation; dx is how far
+// the drawn text starts to the right of a.x.
+function localSize(a) {
+  if (a.type === "image") return { w: a.w, h: a.h, dx: 0 };
+  const { dx, w, h } = textLayout(a);
+  return { w, h, dx };
+}
+
+// Moves a text box so it starts where its text is drawn, and lets go of
+// refWidth. Done before resizing by hand, which sets the box width.
+function bakeAlignment(a) {
+  if (a.type !== "text" || a.boxWidth || a.refWidth === undefined) return;
+  const { dx } = textLayout(a);
+  delete a.refWidth;
+  if (!dx) return;
+  const s = view.vp.scale;
+  const [vx, vy] = view.vp.convertToViewportPoint(a.x, a.y);
+  const angle = (relativeAngle(a, view.rotation) * Math.PI) / 180;
+  [a.x, a.y] = view.vp.convertToPdfPoint(vx + dx * s * Math.cos(angle), vy + dx * s * Math.sin(angle));
 }
 
 // Axis-aligned bounding box in view (CSS pixel) coordinates.
@@ -638,12 +843,12 @@ function viewBox(a, vp, rotation) {
     const y = Math.min(...ys) - pad;
     return { x, y, w: Math.max(...xs) + pad - x, h: Math.max(...ys) + pad - y };
   }
-  const { w, h } = localSize(a);
+  const { w, h, dx } = localSize(a);
   const [ax, ay] = vp.convertToViewportPoint(a.x, a.y);
   const angle = (relativeAngle(a, rotation) * Math.PI) / 180;
   const cos = Math.round(Math.cos(angle));
   const sin = Math.round(Math.sin(angle));
-  const corners = [[0, 0], [w * s, 0], [0, h * s], [w * s, h * s]]
+  const corners = [[dx * s, 0], [(dx + w) * s, 0], [dx * s, h * s], [(dx + w) * s, h * s]]
     .map(([cx, cy]) => [ax + cx * cos - cy * sin, ay + cx * sin + cy * cos]);
   const xs = corners.map((p) => p[0]);
   const ys = corners.map((p) => p[1]);
@@ -724,6 +929,7 @@ overlay.addEventListener("pointerdown", (event) => {
   if (tool === "select") {
     const sel = selectedAnnot();
     if (sel && hasHandle(sel) && onHandle(sel, pt)) {
+      bakeAlignment(sel);
       drag = { mode: "resize", annot: sel, orig: structuredClone(sel), box: viewBox(sel, view.vp, view.rotation), before: snapshot(), moved: false };
     } else {
       const hit = hitTest(pt);
@@ -774,6 +980,7 @@ overlay.addEventListener("pointermove", (event) => {
       overlay.style.cursor = block ? "text" : "";
       if (block !== hoverBlock) {
         hoverBlock = block;
+        guessStripped(block);
         drawOverlay();
       }
       return;
@@ -854,6 +1061,14 @@ overlay.addEventListener("pointercancel", endDrag);
 
 // created: the annotation was made for this edit (an original text block
 // taken over), so finishing without a change undoes it.
+// What the text box is written on: the page's own background for an edited
+// block, else white or a dark tone, whichever the text color reads against.
+function editorBackground(color, annot) {
+  if (annot && annot.replaces && /^#[0-9a-f]{6}$/i.test(annot.replaces.fill)) return annot.replaces.fill;
+  const c = /^#[0-9a-f]{6}$/i.test(color) ? rgbOf(color.slice(1)) : [0, 0, 0];
+  const lum = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  return lum > 150 ? "rgba(20, 20, 30, 0.85)" : "rgba(255, 255, 255, 0.85)";
+}
 function openEditor(annot, pt, created) {
   const page = currentPage();
   const s = view.vp.scale;
@@ -864,6 +1079,8 @@ function openEditor(annot, pt, created) {
   const font = annot ? annot.font : fontInput.value;
   const lineHeight = (annot && annot.lineHeight) || LINE_HEIGHT;
   const boxWidth = annot && annot.boxWidth;
+  const align = annot ? annot.align || "left" : defaultAlign;
+  const refWidth = annot && !boxWidth ? annot.refWidth : undefined;
   const [vx, vy] = view.vp.convertToViewportPoint(x, y);
   const el = document.createElement("textarea");
   el.className = "text-editor";
@@ -878,11 +1095,16 @@ function openEditor(annot, pt, created) {
     fontWeight: bold ? "700" : "400",
     lineHeight: String(lineHeight),
     whiteSpace: boxWidth ? "pre-wrap" : "pre",
+    textAlign: align,
     color,
+    background: editorBackground(color, annot),
   });
   const autosize = () => {
     el.style.width = "0px";
-    el.style.width = boxWidth ? `${boxWidth * s + 2}px` : `${el.scrollWidth + size * s}px`;
+    const width = boxWidth ? boxWidth * s + 2 : el.scrollWidth + size * s;
+    el.style.width = `${width}px`;
+    // text aligned within a reference width grows around its anchor
+    if (refWidth !== undefined) el.style.left = `${vx + (refWidth * s - width) * (ALIGN_FACTOR[align] || 0)}px`;
     el.style.height = "0px";
     el.style.height = `${el.scrollHeight}px`;
   };
@@ -895,7 +1117,7 @@ function openEditor(annot, pt, created) {
   });
   el.addEventListener("blur", () => commitEditor());
   pageWrap.appendChild(el);
-  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, font, el, created: Boolean(created) };
+  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, font, align, el, created: Boolean(created) };
   if (annot) {
     selectedId = annot.id;
     syncStyleInputs(annot);
@@ -939,7 +1161,7 @@ function commitEditor() {
       }
     } else if (text) {
       pushUndo();
-      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, font: e.font, rotation: rotationOf(page) };
+      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, font: e.font, align: e.align === "left" ? undefined : e.align, rotation: rotationOf(page) };
       page.annots.push(a);
       selectedId = a.id;
     }
@@ -952,9 +1174,35 @@ function commitEditor() {
 
 // --- style inputs ------------------------------------------------------------------------
 
+const alignButtons = [...document.querySelectorAll("[data-align]")];
+let defaultAlign = "left";
+
+function showAlign(value) {
+  for (const button of alignButtons) button.setAttribute("aria-pressed", String(button.dataset.align === value));
+}
+
+for (const button of alignButtons) {
+  button.addEventListener("click", () => {
+    const value = button.dataset.align;
+    const a = selectedAnnot();
+    if (a && a.type === "text") {
+      if ((a.align || "left") !== value) {
+        pushUndo();
+        a.align = value === "left" ? undefined : value;
+        drawOverlay();
+        drawThumb(current);
+      }
+    } else {
+      defaultAlign = value;
+    }
+    showAlign(value);
+  });
+}
+
 function syncStyleInputs(a) {
   if (a.color) colorInput.value = a.color;
   if (a.type === "text") {
+    showAlign(a.align || "left");
     sizeInput.value = a.size;
     boldBtn.setAttribute("aria-pressed", String(Boolean(a.bold)));
     fontInput.value = a.font || "sans";
@@ -965,7 +1213,6 @@ function syncStyleInputs(a) {
 function applyStyle(prop, value) {
   const a = selectedAnnot();
   if (!a || !(prop in a) || a[prop] === value) return;
-  if (a.type === "rect" && a.kind === "whiteout") return;
   pushUndo();
   a[prop] = value;
   drawOverlay();
@@ -1206,8 +1453,14 @@ function loadBlocks(page) {
         }),
       };
       const { metadata } = await extractPdfTexts(onePage, null, { segmentsFor: () => segments });
+      await localReady; // the installed fonts, if the user allowed them
       const pageFont = fontByName(segments, null);
-      return metadata.map((m, index) => ({ ...m, index, font: guessFont(m, segments, content, pageFont) }));
+      return metadata.map((m, index) => ({
+        ...m,
+        index,
+        font: guessFont(m, segments, content, pageFont),
+        lineAlign: m.lines > 1 ? alignOfLines(m, content.items) : null,
+      }));
     })();
     pageBlocks.set(key, promise);
     show(busyMsg, "文字を読み取り中…");
@@ -1215,7 +1468,7 @@ function loadBlocks(page) {
       loadedBlocks.set(key, blocks);
       if (tool === "edit" && currentPage() && blockKey(currentPage()) === key) {
         drawOverlay();
-        if (!blocks.length) showError("このページには編集できる文字がありません（スキャンした画像の PDF など）");
+        if (!blocks.length) showError("編集できる文字がありません");
       }
     }, () => {
       pageBlocks.delete(key);
@@ -1249,7 +1502,42 @@ function sampleBackground(block) {
   const y1 = Math.min(pdfCanvas.height, Math.ceil((r.y + r.h + 3) * dpr));
   if (x1 - x0 < 6 || y1 - y0 < 6) return null;
   const image = pdfCanvas.getContext("2d").getImageData(x0, y0, x1 - x0, y1 - y0);
-  return sampleBlockColors(image, { x0: 2, y0: 2, x1: image.width - 3, y1: image.height - 3 });
+  const sampled = sampleBlockColors(image, { x0: 2, y0: 2, x1: image.width - 3, y1: image.height - 3 });
+  if (!sampled) return null;
+  return { ...sampled, ink: strongestInk(image, sampled.fill) || sampled.ink };
+}
+
+const rgbOf = (hex) => [0, 2, 4].map((i) => parseInt(hex.slice(i, i + 2), 16));
+const colorGap = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+// The text color seen on the page: the mean of the pixels farthest from the
+// background. Thin strokes are blended with it at their edges, so the
+// commonest ink pixel is usually paler than the real color.
+function strongestInk(image, fillHex) {
+  const fill = rgbOf(fillHex);
+  const { data } = image;
+  const gaps = [];
+  for (let i = 0; i < data.length; i += 4) {
+    const gap = colorGap([data[i], data[i + 1], data[i + 2]], fill);
+    if (gap > 60) gaps.push([gap, i]);
+  }
+  if (gaps.length < 4) return null;
+  gaps.sort((p, q) => q[0] - p[0]);
+  const top = gaps.slice(0, Math.max(4, Math.round(gaps.length * 0.12)));
+  const sum = [0, 0, 0];
+  for (const [, i] of top) for (let k = 0; k < 3; k++) sum[k] += data[i + k];
+  return sum.map((v) => Math.round(v / top.length).toString(16).padStart(2, "0")).join("").toUpperCase();
+}
+
+// The color a block's text is written in. The page content says so when it
+// can; that is not believed when the color would be invisible on the
+// background the page shows (black set before a dark fill, say), and it is
+// missing for patterns and unusual color spaces. Then the rendered page tells.
+function inkOf(contentColor, sampled) {
+  const fill = (sampled && sampled.fill) || "FFFFFF";
+  if (contentColor && colorGap(rgbOf(contentColor), rgbOf(fill)) >= 90) return contentColor;
+  if (sampled && sampled.ink) return sampled.ink;
+  return contentColor || (colorGap(rgbOf(fill), [0, 0, 0]) < 200 ? "FFFFFF" : "1E1E1E");
 }
 
 // Typeface (a key of FONTS) for a block's replacement text. The names of the
@@ -1257,7 +1545,80 @@ function sampleBackground(block) {
 // when they say nothing, the fonts of the rest of the page (pageFont), and
 // then pdf.js's own guess from the font's flags.
 function guessFont(block, segments, content, pageFont) {
-  return fontByName(segments, block) || pageFont || fontByPdfjs(content, block) || "sans";
+  return installedFontByName(segments, block) || fontByName(segments, block) || pageFont ||
+    fontByPdfjs(content, block) || "sans";
+}
+
+// --- installed fonts ---------------------------------------------------------------------
+
+// Asks (once) to read the list of installed fonts. Needs a user gesture, so
+// it runs when the edit tool is chosen.
+function startLocalFonts() {
+  if (localReady) return;
+  localReady = window.queryLocalFonts
+    ? window.queryLocalFonts().then((list) => { localList = list; }, () => { localList = []; })
+    : Promise.resolve().then(() => { localList = []; });
+}
+
+const normName = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const STYLE_TAIL_RE = /(regular|bold|italic|oblique|medium|light|semibold|demibold|black|thin|book|roman|mt|ps)+$/;
+const isStyle = (face, re) => re.test(face.style || "");
+
+// The installed face a PDF font name (subset prefix already gone, as in
+// "MeiryoUI" or "YuGothic-Regular") stands for.
+function matchInstalled(pdfName) {
+  if (!localList || !localList.length || !pdfName || /[^\x20-\x7e]/.test(pdfName)) return null;
+  const n = normName(pdfName);
+  if (!n) return null;
+  const exact = localList.find((f) => normName(f.postscriptName) === n) ||
+    localList.find((f) => normName(f.fullName) === n);
+  if (exact) return exact;
+  const base = n.replace(STYLE_TAIL_RE, "");
+  const family = base ? localList.filter((f) => normName(f.family) === base) : [];
+  return family.find((f) => isStyle(f, /^(regular|normal|book|roman)$/i)) || family[0] || null;
+}
+
+// Registers the family of an installed face for use as a text font and
+// returns its key.
+function registerInstalled(face, fallback) {
+  const siblings = localList.filter((f) => f.family === face.family);
+  const regular = siblings.find((f) => isStyle(f, /^(regular|normal|book|roman)$/i)) ||
+    (isStyle(face, /bold/i) ? null : face) || face;
+  const bold = siblings.find((f) => isStyle(f, /^bold$/i)) || (isStyle(face, /^bold$/i) ? face : null);
+  const key = `local:${regular.postscriptName}`;
+  if (!localFonts.has(key)) {
+    const css = `"${face.family}", ${FONTS[fallback].css}`;
+    measureCtx.font = `100px ${css}`;
+    const m = measureCtx.measureText("あAg");
+    localFonts.set(key, {
+      family: face.family,
+      css,
+      regular,
+      bold,
+      fallback,
+      mid: m.fontBoundingBoxAscent ? (m.fontBoundingBoxAscent - m.fontBoundingBoxDescent) / 200 : FONTS[fallback].mid,
+    });
+    const option = document.createElement("option");
+    option.value = key;
+    option.textContent = face.family;
+    fontInput.appendChild(option);
+  }
+  return key;
+}
+
+// The installed font the block's text is drawn in: the font name most
+// glyphs use, when this computer has it.
+function installedFontByName(segments, block) {
+  if (!localList || !localList.length) return null;
+  const votes = new Map();
+  for (const seg of segments) {
+    if (!seg.visible || !seg.font || !inBlock(block, (seg.x0 + seg.x1) / 2, seg.y0)) continue;
+    votes.set(seg.font, (votes.get(seg.font) || 0) + (seg.count || 1));
+  }
+  const [name] = [...votes].sort((p, q) => q[1] - p[1])[0] || [];
+  const face = matchInstalled(name);
+  if (!face) return null;
+  return registerInstalled(face, fontFromName(name) || fontFromName(face.family) || "sans");
 }
 
 // Sans first: "Sans Serif", "Century Gothic". Japanese names may be stored
@@ -1332,6 +1693,89 @@ function mainStyle(runs) {
   return { color: color ? color[0] : null, bold: total > 0 && bold * 2 > total };
 }
 
+// --- alignment of original text -------------------------------------------------------------
+
+// A PDF stores where each string starts, not how the paragraph was aligned.
+// Several lines tell: equal left edges (left), equal right edges (right) or
+// equal centers (center). null when they do not agree, or all lines are as
+// wide as the block.
+function alignOfLines(block, items) {
+  const rows = [];
+  for (const item of items || []) {
+    const [a, b, , d, x, y] = item.transform || [];
+    if (!item.str || !item.str.trim() || !(a > 0 && d > 0) || Math.abs(b) > a * 0.02) continue;
+    if (x < block.x - 2 || x > block.x + block.w + 2) continue;
+    if (y < block.y - block.size * 0.3 || y > block.y + block.h + block.size * 0.3) continue;
+    let row = rows.find((r) => Math.abs(r.y - y) < 0.35 * block.size);
+    if (!row) rows.push((row = { y, x0: x, x1: x }));
+    row.x0 = Math.min(row.x0, x);
+    row.x1 = Math.max(row.x1, x + (item.width || 0));
+  }
+  if (rows.length < 2) return null;
+  const tol = block.size * 0.2;
+  const same = (values) => values.every((v) => Math.abs(v - values[0]) <= tol);
+  const left = same(rows.map((r) => r.x0));
+  const right = same(rows.map((r) => r.x1));
+  const center = same(rows.map((r) => (r.x0 + r.x1) / 2));
+  if (left) return right && center ? null : "left";
+  if (right) return "right";
+  if (center) return "center";
+  return null;
+}
+
+// Free background to the left and right of a block, in points, read from the
+// rendered page: how far the block's background color goes before something
+// else (a box edge, other text, a picture) starts.
+function roomsAround(block, fillHex) {
+  const dpr = window.devicePixelRatio || 1;
+  const scale = view.vp.scale * dpr;
+  const r = viewRect({ x1: block.x, y1: block.y, x2: block.x + block.w, y2: block.y + block.h }, view.vp);
+  const y0 = Math.max(0, Math.floor((r.y + r.h * 0.2) * dpr));
+  const y1 = Math.min(pdfCanvas.height, Math.ceil((r.y + r.h * 0.8) * dpr));
+  const width = pdfCanvas.width;
+  if (y1 <= y0 || !/^[0-9a-f]{6}$/i.test(fillHex)) return null;
+  const rows = y1 - y0;
+  const { data } = pdfCanvas.getContext("2d").getImageData(0, y0, width, rows);
+  const fill = [0, 2, 4].map((i) => parseInt(fillHex.slice(i, i + 2), 16));
+  const differs = (x) => {
+    let n = 0;
+    for (let y = 0; y < rows; y += 1) {
+      const i = (y * width + x) * 4;
+      if (Math.abs(data[i] - fill[0]) + Math.abs(data[i + 1] - fill[1]) + Math.abs(data[i + 2] - fill[2]) > 90) n += 1;
+    }
+    return n >= Math.max(1, rows * 0.06);
+  };
+  const pad = Math.max(2, Math.round(block.size * scale * 0.15));
+  const from = Math.floor(r.x * dpr) - pad;
+  const to = Math.ceil((r.x + r.w) * dpr) + pad;
+  let left = Math.max(0, from);
+  while (left > 0 && !differs(left - 1)) left -= 1;
+  let right = Math.min(width - 1, to);
+  while (right < width - 1 && !differs(right + 1)) right += 1;
+  return { left: (from - left) / scale, right: (right - to) / scale };
+}
+
+// Alignment to keep when a block is replaced: the lines say it for a
+// paragraph; for a single line the room on each side does. Equal room means
+// centered, no room on the right means right-aligned, anything else left.
+function guessAlign(block, fillHex) {
+  if (block.lineAlign) return block.lineAlign;
+  const rooms = viewReady() ? roomsAround(block, fillHex) : null;
+  if (!rooms) return "left";
+  const { left, right } = rooms;
+  const near = block.size * 1.5;
+  if (left < near && right < near) return "left";
+  if (Math.abs(left - right) <= Math.max(block.size * 0.6, (left + right + block.w) * 0.08)) return "center";
+  // other objects on the same row (a logo, a page number) cut the rooms
+  // short; text centered on the page is still centered
+  const [vx0, , vx1] = view.vp.viewBox;
+  if (Math.abs(block.x + block.w / 2 - (vx0 + vx1) / 2) <= Math.max(block.size * 0.4, 2)) return "center";
+  // a short line in the right half that ends near the page edge
+  const nearEdge = vx1 - (block.x + block.w) <= Math.max(block.size * 2.5, (vx1 - vx0) * 0.04);
+  if ((right < near && left > right) || (block.x + block.w / 2 > (vx0 + vx1) / 2 && nearEdge)) return "right";
+  return "left";
+}
+
 // Takes over an original text block: a text annotation with the same text,
 // position, size and color replaces it, and the editor opens on it.
 function startBlockEdit(pt) {
@@ -1346,25 +1790,32 @@ function startBlockEdit(pt) {
   }
   const sampled = sampleBackground(block);
   const style = mainStyle(block.runs);
-  const ink = style.color || (sampled && sampled.ink) || "000000";
+  const ink = inkOf(style.color, sampled);
   const lineHeight = block.lines > 1 && block.leading > 0
     ? Math.round((block.leading / block.size) * 1000) / 1000
     : LINE_HEIGHT;
+  const align = guessAlign(block, (sampled && sampled.fill) || "FFFFFF");
+  // A paragraph keeps its width (with a little slack, as the replacement
+  // font may run wider) and rewraps inside it, aligned the way it was. A
+  // single line is aligned within its original width, so a longer or shorter
+  // text grows or shrinks around the same left edge, center or right edge.
+  const boxWidth = block.lines > 1 ? Math.round(block.w * 1.04 * 10) / 10 : null;
+  const slack = boxWidth ? boxWidth - block.w : 0;
   pushUndo();
   const a = {
     id: nextId++,
     type: "text",
     text: block.text,
-    x: block.x,
+    x: block.x - slack * (ALIGN_FACTOR[align] || 0),
     y: block.firstBaseline + baselineOffset(lineHeight, block) * block.size,
     size: block.size,
     color: `#${ink.toLowerCase()}`,
     bold: style.bold,
     font: block.font,
     lineHeight,
-    // A paragraph keeps its width (with a little slack, as the replacement
-    // font may run wider) and rewraps; a single line just grows.
-    boxWidth: block.lines > 1 ? Math.round(block.w * 1.04 * 10) / 10 : null,
+    boxWidth,
+    refWidth: boxWidth ? undefined : block.w,
+    align: align === "left" ? undefined : align,
     rotation: 0, // block positions are in unrotated user space
     replaces: {
       block: block.index,
@@ -1507,13 +1958,81 @@ function dropUnreachable(PDFLib, out) {
   }
 }
 
+// The fonts saved text is written in. An edited block keeps the installed
+// font it was drawn in when that font is TrueType, may be embedded and has
+// every character; otherwise it gets the Noto font the preview falls back
+// to (counted in fontFallbacks). Returns a function from annotation to
+// embedded font.
+let fontFallbacks = 0;
+const isCollection = (bytes) => bytes[0] === 0x74 && bytes[1] === 0x74 && bytes[2] === 0x63 && bytes[3] === 0x66; // "ttcf"
+
+async function embedFonts(out, fontkit, texts) {
+  let wanted; // PostScript name of the face to take from a .ttc
+  const open = (bytes) => fontkit.create(bytes, isCollection(bytes) ? wanted : undefined);
+  out.registerFontkit({ create: open });
+  const parsed = new Map(); // installed face -> { bytes, font } or null
+  const faces = new Map(); // key -> installed face
+  const keys = new Map(); // annotation -> key of its font
+  fontFallbacks = 0;
+
+  const usable = async (face) => {
+    if (!parsed.has(face)) {
+      let entry = null;
+      try {
+        const bytes = new Uint8Array(await (await face.blob()).arrayBuffer());
+        wanted = face.postscriptName;
+        const font = open(bytes);
+        const os2 = font["OS/2"];
+        const restricted = os2 && (os2.fsType & 0x2) && !(os2.fsType & 0xc);
+        if (font.directory.tables.glyf && !restricted) entry = { bytes, font };
+      } catch (_) {
+        entry = null;
+      }
+      parsed.set(face, entry);
+    }
+    return parsed.get(face);
+  };
+
+  for (const a of texts) {
+    const local = localFonts.get(a.font);
+    let key = null;
+    if (local) {
+      const face = (a.bold && local.bold) || local.regular;
+      const entry = await usable(face);
+      if (entry && [...a.text].every((ch) => /\s/.test(ch) || entry.font.hasGlyphForCodePoint(ch.codePointAt(0)))) {
+        key = `local:${face.postscriptName}`;
+        faces.set(key, face);
+      } else {
+        fontFallbacks += 1;
+      }
+    }
+    if (!key) {
+      const web = local ? FONTS[local.fallback] : fontOf(a);
+      key = a.bold ? web.bold : web.regular;
+    }
+    keys.set(a, key);
+  }
+
+  const embedded = new Map();
+  for (const key of new Set(keys.values())) {
+    if (faces.has(key)) {
+      const face = faces.get(key);
+      wanted = face.postscriptName;
+      embedded.set(key, await out.embedFont(parsed.get(face).bytes, { subset: true }));
+    } else {
+      const bytes = await loadFont(key);
+      embedded.set(key, await out.embedFont(bytes, { subset: true }));
+    }
+  }
+  return (a) => embedded.get(keys.get(a));
+}
+
 async function buildPdf(PDFLib, fontkit) {
   const { rgb, degrees, BlendMode, LineCapStyle } = PDFLib;
   // The first file is edited in place rather than copied page by page into a
   // new document, so what belongs to the whole document (form fields,
   // bookmarks, links between pages, metadata) stays.
   const out = await loadLibDoc(PDFLib, 0);
-  out.registerFontkit(fontkit);
   const original = out.getPages();
 
   // One copyPages call per source keeps resources shared between its pages.
@@ -1532,15 +2051,10 @@ async function buildPdf(PDFLib, fontkit) {
   setPageOrder(PDFLib, out, doc.pages.map((p) => copied.get(p.id)), original);
 
   const texts = doc.pages.flatMap((p) => p.annots.filter((a) => a.type === "text" && a.text));
-  const fonts = new Map(); // "url" -> embedded font
-  const fontUrl = (a) => (a.bold ? fontOf(a).bold : fontOf(a).regular);
+  let fontFor = () => null;
   if (texts.length) {
     setBusy(true, "日本語フォントを読み込み中…");
-    for (const url of new Set(texts.map(fontUrl))) {
-      const fontBytes = await loadFont(url);
-      patchFontkitSubset(fontkit, fontBytes);
-      fonts.set(url, await out.embedFont(fontBytes, { subset: true }));
-    }
+    fontFor = await embedFonts(out, fontkit, texts);
     setBusy(true, "PDF を作成中…");
   }
   const forms = new Map(); // form XObjects already rewritten, for removePageText
@@ -1577,8 +2091,8 @@ async function buildPdf(PDFLib, fontkit) {
         const x = Math.min(a.x1, a.x2);
         const y = Math.min(a.y1, a.y2);
         const box = { x, y, width: Math.abs(a.x2 - a.x1), height: Math.abs(a.y2 - a.y1) };
-        if (a.kind === "whiteout") {
-          pg.drawRectangle({ ...box, color: rgb(1, 1, 1) });
+        if (a.kind === "fill") {
+          pg.drawRectangle({ ...box, color });
         } else if (a.kind === "highlight") {
           pg.drawRectangle({ ...box, color, opacity: HIGHLIGHT_OPACITY, blendMode: BlendMode.Multiply });
         } else {
@@ -1598,10 +2112,11 @@ async function buildPdf(PDFLib, fontkit) {
         const [vx, vy] = vp.convertToViewportPoint(a.x, a.y);
         if (a.type === "text") {
           const lh = a.lineHeight || LINE_HEIGHT;
-          textLines(a).forEach((line, i) => {
+          const layout = textLayout(a);
+          layout.lines.forEach((line, i) => {
             if (!line) return;
-            const [x, y] = vp.convertToPdfPoint(vx, vy + (i * lh + baselineOffset(lh, a)) * a.size);
-            pg.drawText(line, { x, y, size: a.size, font: fonts.get(fontUrl(a)), color, rotate: degrees(a.rotation) });
+            const [x, y] = vp.convertToPdfPoint(vx + layout.offsets[i], vy + (i * lh + baselineOffset(lh, a)) * a.size);
+            pg.drawText(line, { x, y, size: a.size, font: fontFor(a), color, rotate: degrees(a.rotation) });
           });
         } else if (a.type === "image") {
           const [x, y] = vp.convertToPdfPoint(vx, vy + a.h);
@@ -1650,9 +2165,10 @@ async function download() {
     const filename = `${baseName}_edited.pdf`;
     if (!(await saveFile(filename, new Blob([bytes], { type: "application/pdf" })))) return;
     savedVersion = version;
-    showOk(doc.sources.some((s) => s.restricted)
-      ? `${filename} を保存しました。元の PDF にあった印刷・編集の制限は外れています`
-      : `${filename} を保存しました`);
+    const notes = [];
+    if (doc.sources.some((s) => s.restricted)) notes.push("印刷・編集の制限は外れています");
+    if (fontFallbacks) notes.push(`${fontFallbacks} 件は元のフォントに文字がないため Noto で書きました`);
+    showOk([`${filename} を保存しました`, ...notes].join("。"));
   } catch (err) {
     showError(`保存できませんでした: ${err.message || err}`);
   } finally {
@@ -1672,9 +2188,29 @@ function setTool(name) {
   for (const button of toolButtons) button.setAttribute("aria-pressed", String(button.dataset.tool === name));
   hoverBlock = null;
   if (name !== "select") selectedId = null;
+  if (name === "edit") startLocalFonts();
+  placeFillTip();
   drawOverlay();
   updateControls();
 }
+
+// The fill warning sits above the 矩形塗り button, or below it when the
+// toolbar is stuck at the top of the window and there is no room above.
+const fillTip = document.getElementById("fillTip");
+function placeFillTip() {
+  fillTip.hidden = tool !== "fill";
+  if (fillTip.hidden) return;
+  const button = toolButtons.find((b) => b.dataset.tool === "fill");
+  const bar = fillTip.parentElement.getBoundingClientRect();
+  const rect = button.getBoundingClientRect();
+  const above = rect.top - fillTip.offsetHeight - 6 >= 0;
+  fillTip.style.left = `${Math.max(0, rect.left - bar.left)}px`;
+  fillTip.style.top = above
+    ? `${rect.top - bar.top - fillTip.offsetHeight - 6}px`
+    : `${rect.bottom - bar.top + 6}px`;
+}
+window.addEventListener("scroll", placeFillTip, { passive: true });
+window.addEventListener("resize", placeFillTip);
 
 function setZoom(next) {
   commitEditor();
@@ -1687,8 +2223,6 @@ function updateControls() {
   const count = doc.pages.length;
   pageLabel.textContent = count ? `${current + 1} / ${count}` : "– / –";
   zoomLabel.textContent = `${Math.round(zoom * 100)}%`;
-  editMeta.textContent = count ? `${count} ページ · 書き込み ${annotCount()} 件` : "";
-  downloadHint.textContent = count ? `${baseName}_edited.pdf` : "";
   if (busy) return;
   undoBtn.disabled = !undoStack.length;
   redoBtn.disabled = !redoStack.length;

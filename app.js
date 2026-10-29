@@ -7,21 +7,41 @@
 
 const PDFJS_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs";
 const PDFJS_WORKER_URL = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
-const PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js";
-const PDF_LIB_SRI = "sha384-weMABwrltA6jWR8DDe9Jp5blk+tZQh7ugpCsF3JwSA53WZM9/14PjS5LAJNHNjAI";
+// The maintained pdf-lib fork: same API, and it can decrypt, which pdf-lib
+// 1.17 cannot (it copied encrypted streams as they were, garbling the page).
+const PDF_LIB_URL = "https://cdn.jsdelivr.net/npm/@cantoo/pdf-lib@2.11.1/dist/pdf-lib.min.js";
+const PDF_LIB_SRI = "sha384-BcRbGROz3cx4LSKcOw2L5YxAxiJPWIEmXRMrYbXu87aSiU5uMQ4qB9v8FEjrBhhq";
 const FONTKIT_URL = "https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js";
 const FONTKIT_SRI = "sha384-2p6U+1mmqF10USehFeRiyG2ESG9FwIqN+jxULn5w9jjQIihSn9Pt13dVCn/Hawjn";
-// The same family the page loads from Google Fonts, so text looks the same on
-// screen and in the saved file. Only the glyphs used are embedded. The URLs
-// come from lib/pdf-text.js (PDF_FONT_URL, PDF_BOLD_FONT_URL).
-const CANVAS_FONT = "\"Noto Sans JP\", sans-serif";
+// Typefaces text is written in. The fonts in a PDF usually hold only the
+// glyphs it uses, so edited text cannot keep its own font; it gets the one
+// of these that looks like it (guessFont). Each is the family the page loads
+// from Google Fonts, so text looks the same on screen and in the saved file,
+// and only the glyphs used are embedded. The sans URLs come from
+// lib/pdf-text.js (PDF_FONT_URL, PDF_BOLD_FONT_URL). mid is (ascent -
+// descent) / 2 of the font, for baselineOffset.
+const FONTS = {
+  sans: {
+    css: "\"Noto Sans JP\", sans-serif",
+    regular: PDF_FONT_URL,
+    bold: PDF_BOLD_FONT_URL,
+    mid: 0.436,
+  },
+  serif: {
+    css: "\"Noto Serif JP\", serif",
+    regular: "https://cdn.jsdelivr.net/npm/@expo-google-fonts/noto-serif-jp@0.4.1/400Regular/NotoSerifJP_400Regular.ttf",
+    bold: "https://cdn.jsdelivr.net/npm/@expo-google-fonts/noto-serif-jp@0.4.1/700Bold/NotoSerifJP_700Bold.ttf",
+    mid: 0.4325,
+  },
+};
+const fontOf = (a) => FONTS[a.font] || FONTS.sans;
 
 // Text boxes are laid out from their top-left corner: line i has its baseline
-// at (i * lineHeight + baselineOffset(lineHeight)) * size. With Noto Sans JP
-// (ascent 1.16, descent 0.288) this is where a textarea with the same
-// line-height puts the baseline.
+// at (i * lineHeight + baselineOffset(lineHeight, a)) * size. With the font's
+// ascent and descent (Noto Sans JP: 1.16 and 0.288) this is where a textarea
+// with the same line-height puts the baseline.
 const LINE_HEIGHT = 1.3;
-const baselineOffset = (lineHeight) => lineHeight / 2 + 0.436;
+const baselineOffset = (lineHeight, a) => lineHeight / 2 + fontOf(a).mid;
 const HIGHLIGHT_OPACITY = 0.35;
 const ZOOM_STEPS = [0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 const THUMB_WIDTH = 132;
@@ -44,6 +64,7 @@ const imageBtn = document.getElementById("imageBtn");
 const imageInput = document.getElementById("imageInput");
 const colorInput = document.getElementById("colorInput");
 const boldBtn = document.getElementById("boldBtn");
+const fontInput = document.getElementById("fontInput");
 const sizeInput = document.getElementById("sizeInput");
 const widthInput = document.getElementById("widthInput");
 const undoBtn = document.getElementById("undoBtn");
@@ -69,7 +90,7 @@ const errorMsg = document.getElementById("errorMsg");
 const okMsg = document.getElementById("okMsg");
 
 const doc = {
-  sources: [], // { name, bytes, pdf }: bytes for pdf-lib, pdf for pdf.js
+  sources: [], // { name, bytes, pdf, restricted }: bytes for pdf-lib, pdf for pdf.js
   pages: [], // { id, src, index, baseRotation, rotation, annots }
   images: new Map(), // key -> { dataUrl, mime }
 };
@@ -90,7 +111,13 @@ let busy = false;
 let nextId = 1;
 let baseName = "document";
 let okTimer = null;
-let savedUndoDepth = 0; // undo depth at the last save, for the leave-page warning
+// Every change gets a new version number and undo/redo bring the old one
+// back, so the leave-page warning knows whether the state on screen is the
+// one last saved (the undo depth cannot tell: undo then a new change, or a
+// full undo stack, keep the same depth).
+let version = 0;
+let lastVersion = 0;
+let savedVersion = 0;
 
 const loads = new Map();
 const thumbCache = new Map(); // "src:index:rotation" -> Promise<canvas>
@@ -216,18 +243,25 @@ function selectedAnnot() {
 
 function snapshot() {
   const page = currentPage();
-  return { pages: structuredClone(doc.pages), currentId: page ? page.id : null };
+  return { pages: structuredClone(doc.pages), currentId: page ? page.id : null, version };
 }
 
 function pushUndo(snap) {
   undoStack.push(snap || snapshot());
   if (undoStack.length > MAX_UNDO) undoStack.shift();
   redoStack = [];
+  version = ++lastVersion;
   updateControls();
+}
+
+// Takes back the step just pushed, when the change it was for did not happen.
+function dropUndo() {
+  version = undoStack.pop().version;
 }
 
 function restore(snap) {
   doc.pages = snap.pages;
+  version = snap.version;
   const index = doc.pages.findIndex((p) => p.id === snap.currentId);
   current = index >= 0 ? index : Math.min(current, doc.pages.length - 1);
   selectedId = null;
@@ -274,7 +308,10 @@ async function openFiles(fileList, append) {
       try {
         // pdf.js takes ownership of the buffer it is given, so it gets a copy.
         const pdf = await pdfjs.getDocument({ data: bytes.slice(), isEvalSupported: false }).promise;
-        loaded.push({ name: file.name, bytes, pdf });
+        // Opened without a password but encrypted: printing or editing is
+        // restricted. Saving decrypts it, which lifts the restrictions.
+        const restricted = (await pdf.getPermissions()) !== null;
+        loaded.push({ name: file.name, bytes, pdf, restricted });
       } catch (err) {
         throw new Error(err && err.name === "PasswordException"
           ? `${file.name} はパスワード付きのため開けません`
@@ -294,6 +331,7 @@ async function openFiles(fileList, append) {
       libDocs.clear();
       undoStack = [];
       redoStack = [];
+      savedVersion = version;
       selectedId = null;
       baseName = loaded[0].name.replace(/\.pdf$/i, "") || "document";
     }
@@ -486,7 +524,7 @@ function drawAnnot(ctx, a, vp, rotation) {
       ctx.fillStyle = a.color;
       ctx.textBaseline = "alphabetic";
       textLines(a).forEach((line, i) => {
-        ctx.fillText(line, 0, (i * lh + baselineOffset(lh)) * a.size * s);
+        ctx.fillText(line, 0, (i * lh + baselineOffset(lh, a)) * a.size * s);
       });
     } else if (a.type === "image") {
       const img = imageElement(a.image);
@@ -532,14 +570,15 @@ function imageElement(key) {
 // text falls back silently, so redraw once the font slices arrive.
 const requestedGlyphs = new Set();
 
-function ensureGlyphs(text) {
-  const missing = [...new Set(text)].filter((ch) => !requestedGlyphs.has(ch));
+function ensureGlyphs(text, a) {
+  const { css } = fontOf(a);
+  const missing = [...new Set(text)].filter((ch) => !requestedGlyphs.has(`${css}|${ch}`));
   if (!missing.length) return;
-  for (const ch of missing) requestedGlyphs.add(ch);
+  for (const ch of missing) requestedGlyphs.add(`${css}|${ch}`);
   const chars = missing.join("");
   Promise.all([
-    document.fonts.load(`16px ${CANVAS_FONT}`, chars),
-    document.fonts.load(`700 16px ${CANVAS_FONT}`, chars),
+    document.fonts.load(`16px ${css}`, chars),
+    document.fonts.load(`700 16px ${css}`, chars),
   ]).then(() => {
     textLayouts.clear();
     drawOverlay();
@@ -555,7 +594,7 @@ function viewRect(a, vp) {
   return { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
 }
 
-const fontSpec = (a, px) => `${a.bold ? "700 " : ""}${px}px ${CANVAS_FONT}`;
+const fontSpec = (a, px) => `${a.bold ? "700 " : ""}${px}px ${fontOf(a).css}`;
 
 function measureAt(a) {
   measureCtx.font = fontSpec(a, a.size);
@@ -569,7 +608,7 @@ const textLayouts = new Map();
 
 function textLines(a) {
   if (!a.boxWidth) return a.text.split("\n");
-  const key = `${a.bold ? 1 : 0}|${a.size}|${a.boxWidth}|${a.text}`;
+  const key = `${a.font}|${a.bold ? 1 : 0}|${a.size}|${a.boxWidth}|${a.text}`;
   if (!textLayouts.has(key)) {
     if (textLayouts.size > 500) textLayouts.clear();
     textLayouts.set(key, wrapText(a.text, a.boxWidth, measureAt(a)));
@@ -795,7 +834,7 @@ function endDrag() {
     if (box.w < 3 || box.h < 3) {
       const annots = currentPage().annots;
       annots.splice(annots.indexOf(annot), 1);
-      undoStack.pop();
+      dropUndo();
     }
   }
   drawOverlay();
@@ -822,6 +861,7 @@ function openEditor(annot, pt, created) {
   const size = annot ? annot.size : Number(sizeInput.value) || 14;
   const color = annot ? annot.color : colorInput.value;
   const bold = annot ? Boolean(annot.bold) : boldBtn.getAttribute("aria-pressed") === "true";
+  const font = annot ? annot.font : fontInput.value;
   const lineHeight = (annot && annot.lineHeight) || LINE_HEIGHT;
   const boxWidth = annot && annot.boxWidth;
   const [vx, vy] = view.vp.convertToViewportPoint(x, y);
@@ -834,6 +874,7 @@ function openEditor(annot, pt, created) {
     left: `${vx}px`,
     top: `${vy}px`,
     fontSize: `${size * s}px`,
+    fontFamily: fontOf({ font }).css,
     fontWeight: bold ? "700" : "400",
     lineHeight: String(lineHeight),
     whiteSpace: boxWidth ? "pre-wrap" : "pre",
@@ -854,7 +895,7 @@ function openEditor(annot, pt, created) {
   });
   el.addEventListener("blur", () => commitEditor());
   pageWrap.appendChild(el);
-  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, el, created: Boolean(created) };
+  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, font, el, created: Boolean(created) };
   if (annot) {
     selectedId = annot.id;
     syncStyleInputs(annot);
@@ -878,7 +919,7 @@ function commitEditor() {
       // the undo step was pushed when the block was taken over
       if (text === existing.text) {
         page.annots.splice(page.annots.indexOf(existing), 1);
-        undoStack.pop();
+        dropUndo();
         selectedId = null;
       } else {
         existing.text = text;
@@ -898,11 +939,11 @@ function commitEditor() {
       }
     } else if (text) {
       pushUndo();
-      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, rotation: rotationOf(page) };
+      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, font: e.font, rotation: rotationOf(page) };
       page.annots.push(a);
       selectedId = a.id;
     }
-    ensureGlyphs(text);
+    ensureGlyphs(text, e);
     drawThumb(doc.pages.indexOf(page));
   }
   drawOverlay();
@@ -916,6 +957,7 @@ function syncStyleInputs(a) {
   if (a.type === "text") {
     sizeInput.value = a.size;
     boldBtn.setAttribute("aria-pressed", String(Boolean(a.bold)));
+    fontInput.value = a.font || "sans";
   }
   if (a.width) widthInput.value = a.width;
 }
@@ -936,7 +978,7 @@ boldBtn.addEventListener("click", () => {
     pushUndo();
     a.bold = !a.bold;
     boldBtn.setAttribute("aria-pressed", String(a.bold));
-    ensureGlyphs(a.text);
+    ensureGlyphs(a.text, a);
     drawOverlay();
     drawThumb(current);
   } else {
@@ -947,6 +989,11 @@ boldBtn.addEventListener("click", () => {
 colorInput.addEventListener("change", () => {
   if (selectedAnnot()) applyStyle("color", colorInput.value);
   else toolColors[colorSlot(tool)] = colorInput.value;
+});
+fontInput.addEventListener("change", () => {
+  const a = selectedAnnot();
+  if (a && a.type === "text") ensureGlyphs(a.text, { font: fontInput.value });
+  applyStyle("font", fontInput.value);
 });
 sizeInput.addEventListener("change", () => {
   const size = Number(sizeInput.value);
@@ -1111,10 +1158,20 @@ function movePage(from, to) {
 
 const blockKey = (page) => `${page.src}:${page.index}`;
 
+// pdf-lib document of a source, decrypted. The empty password opens what
+// pdf.js opened without one: files that only restrict printing or editing.
+async function loadLibDoc(PDFLib, src) {
+  const { name, bytes } = doc.sources[src];
+  const libDoc = await PDFLib.PDFDocument.load(bytes, { password: "", updateMetadata: false });
+  // An encryption pdf-lib cannot undo leaves it encrypted; copying its
+  // streams as they are would garble the pages.
+  if (libDoc.isEncrypted) throw new Error(`${name} の暗号化を解除できませんでした`);
+  return libDoc;
+}
+
 function libDocOf(src) {
   if (!libDocs.has(src)) {
-    const promise = loadPdfLib().then(({ PDFLib }) =>
-      PDFLib.PDFDocument.load(doc.sources[src].bytes, { ignoreEncryption: true, updateMetadata: false }));
+    const promise = loadPdfLib().then(({ PDFLib }) => loadLibDoc(PDFLib, src));
     libDocs.set(src, promise);
     promise.catch(() => libDocs.delete(src));
   }
@@ -1135,20 +1192,22 @@ function loadBlocks(page) {
       try {
         const { PDFLib } = await loadPdfLib();
         const libDoc = await libDocOf(page.src);
-        if (!libDoc.isEncrypted) segments = collectPageSegments(PDFLib, libDoc.getPage(page.index), new Map());
+        segments = collectPageSegments(PDFLib, libDoc.getPage(page.index), new Map());
       } catch (_) {
         segments = [];
       }
+      let content = null;
       const onePage = {
         numPages: 1,
         getPage: async () => ({
           view: pdfPage.view,
-          getTextContent: () => pdfPage.getTextContent(),
+          getTextContent: async () => (content = await pdfPage.getTextContent()),
           getAnnotations: async () => [],
         }),
       };
       const { metadata } = await extractPdfTexts(onePage, null, { segmentsFor: () => segments });
-      return metadata.map((m, index) => ({ ...m, index }));
+      const pageFont = fontByName(segments, null);
+      return metadata.map((m, index) => ({ ...m, index, font: guessFont(m, segments, content, pageFont) }));
     })();
     pageBlocks.set(key, promise);
     show(busyMsg, "文字を読み取り中…");
@@ -1193,6 +1252,71 @@ function sampleBackground(block) {
   return sampleBlockColors(image, { x0: 2, y0: 2, x1: image.width - 3, y1: image.height - 3 });
 }
 
+// Typeface (a key of FONTS) for a block's replacement text. The names of the
+// fonts drawn in the block decide (Mincho, Times: serif; Gothic, Arial: sans);
+// when they say nothing, the fonts of the rest of the page (pageFont), and
+// then pdf.js's own guess from the font's flags.
+function guessFont(block, segments, content, pageFont) {
+  return fontByName(segments, block) || pageFont || fontByPdfjs(content, block) || "sans";
+}
+
+// Sans first: "Sans Serif", "Century Gothic". Japanese names may be stored
+// as Shift_JIS or UTF-8 bytes (fontNameText).
+const SANS_FONT_RE = /Sans|Gothic|ゴシック|Kaku|Maru|KozGo|Meiryo|メイリオ|Arial|Helvetica|Verdana|Tahoma|Segoe|Calibri|Roboto|Myriad|Frutiger|Futura|Gill|Trebuchet/i;
+const SERIF_FONT_RE = /Serif|Mincho|Minchou|明朝|HiraMin|Ryumin|KozMin|Ming|Song|Batang|Myungjo|Times|Roman|Georgia|Garamond|Cambria|Century|Palatino|Antiqua|Baskerville|Bodoni|Caslon|Didot|Minion|Charter/i;
+
+function fontNameText(name) {
+  if (!/[\x80-\xff]/.test(name)) return name;
+  const bytes = Uint8Array.from(name, (ch) => ch.charCodeAt(0) & 255);
+  for (const encoding of ["utf-8", "shift_jis"]) {
+    try {
+      return new TextDecoder(encoding, { fatal: true }).decode(bytes);
+    } catch (_) {
+      // try the next one
+    }
+  }
+  return name;
+}
+
+function fontFromName(name) {
+  const text = fontNameText(name || "");
+  if (SANS_FONT_RE.test(text)) return "sans";
+  if (SERIF_FONT_RE.test(text)) return "serif";
+  return null;
+}
+
+// Whether a baseline at (x, y) lies in the block (the whole page without one).
+const inBlock = (block, x, y) => !block ||
+  (x >= block.x - 1 && x <= block.x + block.w + 1 && y >= block.y - block.size * 0.5 && y <= block.y + block.h + 1);
+
+// The typeface most glyphs in the block are drawn in, judged by font name.
+function fontByName(segments, block) {
+  const votes = { sans: 0, serif: 0 };
+  for (const seg of segments) {
+    if (!seg.visible || !inBlock(block, (seg.x0 + seg.x1) / 2, seg.y0)) continue;
+    const font = fontFromName(seg.font);
+    if (font) votes[font] += seg.count || 1;
+  }
+  if (!votes.sans && !votes.serif) return null;
+  return votes.serif > votes.sans ? "serif" : "sans";
+}
+
+// pdf.js picks a fallback family for every font from its flags and name.
+function fontByPdfjs(content, block) {
+  if (!content) return null;
+  const votes = { sans: 0, serif: 0 };
+  for (const item of content.items) {
+    if (!item.str || !item.str.trim() || !item.transform) continue;
+    if (!inBlock(block, item.transform[4] + (item.width || 0) / 2, item.transform[5])) continue;
+    const style = content.styles[item.fontName];
+    const family = style && style.fontFamily;
+    if (family === "serif") votes.serif += item.str.length;
+    else if (family === "sans-serif") votes.sans += item.str.length;
+  }
+  if (!votes.sans && !votes.serif) return null;
+  return votes.serif > votes.sans ? "serif" : "sans";
+}
+
 // The color and weight most of the block's text has.
 function mainStyle(runs) {
   const colors = new Map();
@@ -1232,10 +1356,11 @@ function startBlockEdit(pt) {
     type: "text",
     text: block.text,
     x: block.x,
-    y: block.firstBaseline + baselineOffset(lineHeight) * block.size,
+    y: block.firstBaseline + baselineOffset(lineHeight, block) * block.size,
     size: block.size,
     color: `#${ink.toLowerCase()}`,
     bold: style.bold,
+    font: block.font,
     lineHeight,
     // A paragraph keeps its width (with a little slack, as the replacement
     // font may run wider) and rewraps; a single line just grows.
@@ -1252,7 +1377,7 @@ function startBlockEdit(pt) {
     },
   };
   page.annots.push(a);
-  ensureGlyphs(a.text);
+  ensureGlyphs(a.text, a);
   openEditor(a, null, true);
 }
 
@@ -1328,30 +1453,93 @@ function hexToRgb(rgb, hex) {
   return rgb(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
 }
 
+// Puts the document's pages in this order. The tree is rebuilt flat with
+// the pages' inherited attributes moved onto them, as pdf-lib's removePage
+// would delete the page objects that are reused here. The original pages left
+// out are deleted: bookmarks and form fields that point at them would
+// otherwise keep their content in the file.
+function setPageOrder(PDFLib, out, pages, original) {
+  const { PDFName, PDFNumber, PDFPageLeaf } = PDFLib;
+  for (const pg of pages) {
+    for (const key of PDFPageLeaf.InheritableEntries) {
+      const name = PDFName.of(key);
+      const value = pg.node.getInheritableAttribute(name);
+      if (value && !pg.node.get(name)) pg.node.set(name, value);
+    }
+  }
+  const rootRef = out.catalog.get(PDFName.of("Pages"));
+  for (const pg of pages) pg.node.setParent(rootRef);
+  const root = out.catalog.Pages();
+  root.set(PDFName.of("Kids"), out.context.obj(pages.map((pg) => pg.ref)));
+  root.set(PDFName.of("Count"), PDFNumber.of(pages.length));
+  const kept = new Set(pages);
+  for (const pg of original) if (!kept.has(pg)) out.context.delete(pg.ref);
+  // pdf-lib caches the page list and count
+  out.pageCount = pages.length;
+  out.pageCache.invalidate();
+}
+
+// Leaves out of the file the objects nothing refers to any more: the content
+// streams removePageText replaced (they still hold the original text) and the
+// page tree setPageOrder replaced. Fonts and images are embedded by save(),
+// after this.
+function dropUnreachable(PDFLib, out) {
+  const { PDFRef, PDFDict, PDFArray, PDFStream } = PDFLib;
+  const { context } = out;
+  const seen = new Set();
+  const stack = [context.trailerInfo.Root, context.trailerInfo.Info];
+  while (stack.length) {
+    let obj = stack.pop();
+    if (obj instanceof PDFRef) {
+      if (seen.has(obj)) continue;
+      seen.add(obj);
+      obj = context.lookup(obj);
+    }
+    if (obj instanceof PDFStream) obj = obj.dict;
+    if (obj instanceof PDFDict) {
+      for (const [, value] of obj.entries()) stack.push(value);
+    } else if (obj instanceof PDFArray) {
+      stack.push(...obj.asArray());
+    }
+  }
+  for (const [ref] of context.enumerateIndirectObjects()) {
+    if (!seen.has(ref)) context.delete(ref);
+  }
+}
+
 async function buildPdf(PDFLib, fontkit) {
-  const { PDFDocument, rgb, degrees, BlendMode, LineCapStyle } = PDFLib;
-  const out = await PDFDocument.create();
+  const { rgb, degrees, BlendMode, LineCapStyle } = PDFLib;
+  // The first file is edited in place rather than copied page by page into a
+  // new document, so what belongs to the whole document (form fields,
+  // bookmarks, links between pages, metadata) stays.
+  const out = await loadLibDoc(PDFLib, 0);
   out.registerFontkit(fontkit);
+  const original = out.getPages();
 
   // One copyPages call per source keeps resources shared between its pages.
   const copied = new Map();
   for (let src = 0; src < doc.sources.length; src++) {
     const pages = doc.pages.filter((p) => p.src === src);
     if (!pages.length) continue;
-    const source = await PDFDocument.load(doc.sources[src].bytes, { ignoreEncryption: true });
+    if (src === 0) {
+      pages.forEach((p) => copied.set(p.id, original[p.index]));
+      continue;
+    }
+    const source = await loadLibDoc(PDFLib, src);
     const copies = await out.copyPages(source, pages.map((p) => p.index));
     pages.forEach((p, i) => copied.set(p.id, copies[i]));
   }
+  setPageOrder(PDFLib, out, doc.pages.map((p) => copied.get(p.id)), original);
 
   const texts = doc.pages.flatMap((p) => p.annots.filter((a) => a.type === "text" && a.text));
-  const fonts = {}; // keyed by bold
+  const fonts = new Map(); // "url" -> embedded font
+  const fontUrl = (a) => (a.bold ? fontOf(a).bold : fontOf(a).regular);
   if (texts.length) {
     setBusy(true, "日本語フォントを読み込み中…");
-    for (const bold of [false, true]) {
-      if (!texts.some((a) => Boolean(a.bold) === bold)) continue;
-      const fontBytes = await loadFont(bold ? PDF_BOLD_FONT_URL : PDF_FONT_URL);
+    for (const url of new Set(texts.map(fontUrl))) {
+      const fontBytes = await loadFont(url);
       patchFontkitSubset(fontkit, fontBytes);
-      fonts[bold] = await out.embedFont(fontBytes, { subset: true });
+      fonts.set(url, await out.embedFont(fontBytes, { subset: true }));
     }
     setBusy(true, "PDF を作成中…");
   }
@@ -1368,7 +1556,6 @@ async function buildPdf(PDFLib, fontkit) {
 
   for (const page of doc.pages) {
     const pg = copied.get(page.id);
-    out.addPage(pg);
     pg.setRotation(degrees(rotationOf(page)));
     const pdfPage = await pdfPageOf(page);
     // Edited blocks: take the original strings out of the page content
@@ -1413,8 +1600,8 @@ async function buildPdf(PDFLib, fontkit) {
           const lh = a.lineHeight || LINE_HEIGHT;
           textLines(a).forEach((line, i) => {
             if (!line) return;
-            const [x, y] = vp.convertToPdfPoint(vx, vy + (i * lh + baselineOffset(lh)) * a.size);
-            pg.drawText(line, { x, y, size: a.size, font: fonts[Boolean(a.bold)], color, rotate: degrees(a.rotation) });
+            const [x, y] = vp.convertToPdfPoint(vx, vy + (i * lh + baselineOffset(lh, a)) * a.size);
+            pg.drawText(line, { x, y, size: a.size, font: fonts.get(fontUrl(a)), color, rotate: degrees(a.rotation) });
           });
         } else if (a.type === "image") {
           const [x, y] = vp.convertToPdfPoint(vx, vy + a.h);
@@ -1423,6 +1610,8 @@ async function buildPdf(PDFLib, fontkit) {
       }
     }
   }
+  out.setModificationDate(new Date());
+  dropUnreachable(PDFLib, out);
   return out.save();
 }
 
@@ -1460,8 +1649,10 @@ async function download() {
     const bytes = await buildPdf(PDFLib, fontkit);
     const filename = `${baseName}_edited.pdf`;
     if (!(await saveFile(filename, new Blob([bytes], { type: "application/pdf" })))) return;
-    savedUndoDepth = undoStack.length;
-    showOk(`${filename} を保存しました`);
+    savedVersion = version;
+    showOk(doc.sources.some((s) => s.restricted)
+      ? `${filename} を保存しました。元の PDF にあった印刷・編集の制限は外れています`
+      : `${filename} を保存しました`);
   } catch (err) {
     showError(`保存できませんでした: ${err.message || err}`);
   } finally {
@@ -1607,7 +1798,7 @@ document.addEventListener("drop", (event) => {
 });
 
 window.addEventListener("beforeunload", (event) => {
-  if (undoStack.length !== savedUndoDepth) event.preventDefault();
+  if (version !== savedVersion) event.preventDefault();
 });
 
 updateControls();

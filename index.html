@@ -9,8 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500&family=Noto+Sans+JP:wght@400;500;600;700&family=Noto+Serif+JP:wght@400;700&display=swap">
   <style>
-    /* Same palette and components as Translation Supporter
-       (cool neutrals with one electric indigo accent). */
+    /* Cool neutrals with one electric indigo accent (after SmoothUI). */
     :root {
       color-scheme: light dark;
       --bg: #fbfcfd;
@@ -83,14 +82,15 @@
       /* bottom padding keeps the fixed message area from covering content */
       padding: 3.5rem 1.25rem 8rem;
     }
-    h1 { font-size: 2.25rem; font-weight: 600; line-height: 1.15; letter-spacing: -0.8px; margin: 0 0 1rem; }
+    h1 { font-size: 2.5rem; font-weight: 600; line-height: 46px; letter-spacing: -0.8px; margin: 0 0 0.5rem; }
     h1, h2 { font-feature-settings: "palt"; }
     @media (max-width: 768px) {
       main { padding-top: 2rem; }
       .step { padding: 1.1rem 1rem 1.2rem; }
       h1 { font-size: 1.75rem; letter-spacing: -0.5px; }
     }
-    .lede { margin: 0 0 1.5rem; }
+    .page-header { margin-bottom: 1.5rem; }
+    .lede { margin: 0; font-size: 14px; line-height: 22.75px; }
     .note {
       display: flex;
       align-items: center;
@@ -98,6 +98,7 @@
       color: var(--muted);
       font-size: 0.9rem;
     }
+    .lede.note { font-size: 14px; line-height: 22.75px; }
     .note svg { flex: 0 0 auto; width: 1rem; height: 1rem; }
     .step {
       background: var(--surface);
@@ -411,17 +412,27 @@
       .msg.busy::before { animation: none; }
     }
     .disclaimer {
+      margin: 1rem 0 0;
+      font-size: 0.75rem;
       color: var(--muted);
-      font-size: 0.8rem;
-      margin: 1.25rem 0 0;
-      justify-content: center;
+      line-height: 1.45;
     }
+    .app-version {
+      margin: 1.25rem 0 0;
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-align: center;
+    }
+    .app-version a { color: var(--muted); }
+    .app-version a:hover { color: var(--accent); }
   </style>
 </head>
 <body>
   <main>
-    <h1>PDF Editor</h1>
-    <p class="lede note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>ファイルはサーバに送られません</p>
+    <header class="page-header">
+      <h1>PDF Editor</h1>
+      <p class="lede note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>ファイルはサーバに送られません</p>
+    </header>
     <section class="step" id="step1">
       <div class="dropzone" id="pdfDrop" tabindex="0" role="button">
         <strong>PDF を開く</strong>
@@ -494,6 +505,11 @@
       </div>
     </section>
 
+    <p class="disclaimer">ご利用は自己責任でお願いします。</p>
+    <p class="app-version" id="appVersionLine" hidden>
+      <a href="https://github.com/symmr/pdf-editor/" target="_blank" rel="noopener noreferrer">GitHub</a>
+      · <span id="appVersion"></span>
+    </p>
   </main>
   <div class="msg-area" role="status" aria-live="polite">
     <p class="msg busy" id="busyMsg" hidden></p>

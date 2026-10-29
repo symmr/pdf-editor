@@ -1428,7 +1428,7 @@ function libDocOf(src) {
 // Text blocks (lines joined into paragraphs) of a page's original text, in
 // user space: { index, x, y, w, h, size, leading, lines, firstBaseline, text,
 // runs }. PDFs have no text boxes; extractPdfTexts (lib/pdf-text.js) groups
-// the shown strings by position, as Translation Supporter does.
+// the shown strings by position.
 function loadBlocks(page) {
   const key = blockKey(page);
   if (!pageBlocks.has(key)) {
@@ -2336,3 +2336,14 @@ window.addEventListener("beforeunload", (event) => {
 });
 
 updateControls();
+
+(async function showAppVersion() {
+  try {
+    const res = await fetch("version.json", { cache: "no-store" });
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.version) return;
+    document.getElementById("appVersion").textContent = `v${data.version}`;
+    document.getElementById("appVersionLine").hidden = false;
+  } catch (_) {}
+})();

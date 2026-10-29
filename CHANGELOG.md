@@ -6,6 +6,12 @@
 
 形式は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に準拠。
 
+## [Unreleased]
+
+### Changed
+
+- ファイル選択を「ファイルを選択」と `.pdf` の2行に変更
+
 ## [1.0.0] - 2026-10-29
 
 ### Added

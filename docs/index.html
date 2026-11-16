@@ -348,8 +348,10 @@
     #overlay { touch-action: none; }
     .page-wrap[data-tool="select"] #overlay { cursor: default; }
     .page-wrap[data-tool="text"] #overlay { cursor: text; }
-    .bold-btn { font-weight: 700; padding: 0.35rem 0.6rem; }
-    .bold-btn[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--drop); }
+    .bold-btn, .underline-btn { padding: 0.35rem 0.6rem; }
+    .bold-btn { font-weight: 700; }
+    .underline-btn { text-decoration: underline; }
+    .bold-btn[aria-pressed="true"], .underline-btn[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--drop); }
     .page-wrap[data-tool="fill"] #overlay,
     .page-wrap[data-tool="highlight"] #overlay,
     .page-wrap[data-tool="box"] #overlay,
@@ -475,6 +477,7 @@
             <option value="serif">明朝</option>
           </select></label>
           <button type="button" id="boldBtn" class="bold-btn" aria-pressed="false" title="太字" aria-label="太字">B</button>
+          <button type="button" id="underlineBtn" class="underline-btn" aria-pressed="false" title="下線" aria-label="下線">U</button>
           <div class="segmented" role="group" aria-label="揃え">
             <button type="button" data-align="left" aria-pressed="true" aria-label="左揃え" title="左揃え">左</button>
             <button type="button" data-align="center" aria-pressed="false" aria-label="中央揃え" title="中央揃え">中</button>

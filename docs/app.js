@@ -74,6 +74,7 @@ const imageBtn = document.getElementById("imageBtn");
 const imageInput = document.getElementById("imageInput");
 const colorInput = document.getElementById("colorInput");
 const boldBtn = document.getElementById("boldBtn");
+const underlineBtn = document.getElementById("underlineBtn");
 const fontInput = document.getElementById("fontInput");
 const sizeInput = document.getElementById("sizeInput");
 const widthInput = document.getElementById("widthInput");
@@ -744,6 +745,21 @@ function drawAnnot(ctx, a, vp, rotation) {
       layout.lines.forEach((line, i) => {
         ctx.fillText(line, layout.offsets[i] * s, (i * lh + baselineOffset(lh, a)) * a.size * s);
       });
+      if (a.underline) {
+        const measure = measureAt(a);
+        ctx.strokeStyle = a.color;
+        ctx.lineWidth = Math.max(0.5, underlineThickness(a) * s);
+        ctx.lineCap = "butt";
+        layout.lines.forEach((line, i) => {
+          const text = line.trimEnd();
+          if (!text) return;
+          const y = ((i * lh + baselineOffset(lh, a)) * a.size + UNDERLINE_OFFSET * a.size) * s;
+          ctx.beginPath();
+          ctx.moveTo(layout.offsets[i] * s, y);
+          ctx.lineTo((layout.offsets[i] + measure(text)) * s, y);
+          ctx.stroke();
+        });
+      }
     } else if (a.type === "image") {
       const img = imageElement(a.image);
       if (img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, a.w * s, a.h * s);
@@ -811,6 +827,11 @@ function viewRect(a, vp) {
   const [x2, y2] = vp.convertToViewportPoint(a.x2, a.y2);
   return { x: Math.min(x1, x2), y: Math.min(y1, y2), w: Math.abs(x2 - x1), h: Math.abs(y2 - y1) };
 }
+
+// Underline of a text box: a line a little below the baseline, as wide as the
+// line of text, about as thick as the font's own strokes (in points).
+const UNDERLINE_OFFSET = 0.12;
+const underlineThickness = (a) => a.size * (a.bold ? 0.075 : 0.055);
 
 const fontSpec = (a, px) => `${a.bold ? "700 " : ""}${px}px ${fontOf(a).css}`;
 
@@ -1169,6 +1190,7 @@ function openEditor(annot, pt, created) {
   const size = annot ? annot.size : Number(sizeInput.value) || 14;
   const color = annot ? annot.color : colorInput.value;
   const bold = annot ? Boolean(annot.bold) : boldBtn.getAttribute("aria-pressed") === "true";
+  const underline = annot ? Boolean(annot.underline) : underlineBtn.getAttribute("aria-pressed") === "true";
   const font = annot ? annot.font : fontInput.value;
   const lineHeight = (annot && annot.lineHeight) || LINE_HEIGHT;
   const boxWidth = annot && annot.boxWidth;
@@ -1186,6 +1208,7 @@ function openEditor(annot, pt, created) {
     fontSize: `${size * s}px`,
     fontFamily: fontOf({ font }).css,
     fontWeight: bold ? "700" : "400",
+    textDecoration: underline ? "underline" : "none",
     lineHeight: String(lineHeight),
     whiteSpace: boxWidth ? "pre-wrap" : "pre",
     textAlign: align,
@@ -1210,7 +1233,7 @@ function openEditor(annot, pt, created) {
   });
   el.addEventListener("blur", () => commitEditor());
   pageWrap.appendChild(el);
-  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, font, align, el, created: Boolean(created) };
+  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, underline, font, align, el, created: Boolean(created) };
   if (annot) {
     selectedId = annot.id;
     syncStyleInputs(annot);
@@ -1254,7 +1277,7 @@ function commitEditor() {
       }
     } else if (text) {
       pushUndo();
-      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, font: e.font, align: e.align === "left" ? undefined : e.align, rotation: rotationOf(page) };
+      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, underline: e.underline || undefined, font: e.font, align: e.align === "left" ? undefined : e.align, rotation: rotationOf(page) };
       page.annots.push(a);
       selectedId = a.id;
     }
@@ -1298,6 +1321,7 @@ function syncStyleInputs(a) {
     showAlign(a.align || "left");
     sizeInput.value = a.size;
     boldBtn.setAttribute("aria-pressed", String(Boolean(a.bold)));
+    underlineBtn.setAttribute("aria-pressed", String(Boolean(a.underline)));
     fontInput.value = a.font || "sans";
   }
   if (a.width) widthInput.value = a.width;
@@ -1323,6 +1347,19 @@ boldBtn.addEventListener("click", () => {
     drawThumb(current);
   } else {
     boldBtn.setAttribute("aria-pressed", String(boldBtn.getAttribute("aria-pressed") !== "true"));
+  }
+});
+
+underlineBtn.addEventListener("click", () => {
+  const a = selectedAnnot();
+  if (a && a.type === "text") {
+    pushUndo();
+    a.underline = a.underline ? undefined : true;
+    underlineBtn.setAttribute("aria-pressed", String(Boolean(a.underline)));
+    drawOverlay();
+    drawThumb(current);
+  } else {
+    underlineBtn.setAttribute("aria-pressed", String(underlineBtn.getAttribute("aria-pressed") !== "true"));
   }
 });
 
@@ -2249,6 +2286,18 @@ async function buildPdf(PDFLib, fontkit) {
             if (!line) return;
             const [x, y] = vp.convertToPdfPoint(vx + layout.offsets[i], vy + (i * lh + baselineOffset(lh, a)) * a.size);
             pg.drawText(line, { x, y, size: a.size, font: fontFor(a), color, rotate: degrees(a.rotation) });
+            if (a.underline && line.trimEnd()) {
+              const width = fontFor(a).widthOfTextAtSize(line.trimEnd(), a.size);
+              const uy = vy + (i * lh + baselineOffset(lh, a)) * a.size + UNDERLINE_OFFSET * a.size;
+              const start = vp.convertToPdfPoint(vx + layout.offsets[i], uy);
+              const end = vp.convertToPdfPoint(vx + layout.offsets[i] + width, uy);
+              pg.drawLine({
+                start: { x: start[0], y: start[1] },
+                end: { x: end[0], y: end[1] },
+                thickness: underlineThickness(a),
+                color,
+              });
+            }
           });
         } else if (a.type === "image") {
           const [x, y] = vp.convertToPdfPoint(vx, vy + a.h);

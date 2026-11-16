@@ -58,7 +58,7 @@ const ZOOM_STEPS = [0.5, 0.67, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3];
 const THUMB_WIDTH = 132;
 const HANDLE_SIZE = 9;
 const MAX_UNDO = 100;
-const TOOL_KEYS = { v: "select", e: "edit", t: "text", f: "fill", h: "highlight", r: "box", p: "pen" };
+const TOOL_KEYS = { v: "select", t: "text", f: "fill", h: "highlight", r: "box", p: "pen" };
 // Highlights keep their own color so switching tools does not turn them red.
 const toolColors = { highlight: "#ffd400", fill: "#ffffff", other: "#d00000" };
 const colorSlot = (name) => (name === "highlight" || name === "fill" ? name : "other");

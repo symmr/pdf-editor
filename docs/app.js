@@ -137,6 +137,11 @@ const measureCtx = document.createElement("canvas").getContext("2d");
 const pageBlocks = new Map(); // "src:index" -> Promise<blocks> of the original text
 const loadedBlocks = new Map(); // same, once resolved
 const blocksFailed = new Set(); // keys whose text could not be read; the select tool does not retry them
+const pageObjects = new Map(); // "src:index" -> Promise<objects> drawn by the page (lines, shapes, images)
+const loadedObjects = new Map(); // same, once resolved
+const objectsFailed = new Set();
+let selectedObj = null; // { pageId, obj }: a drawn object picked with the select tool, not yet removed
+let hoverObj = null;
 const libDocs = new Map(); // src -> Promise<pdf-lib PDFDocument>, read only
 let hoverBlock = null;
 // An original text block taken over only because the select tool clicked it:
@@ -236,6 +241,12 @@ function selectedAnnot() {
   return page && selectedId != null ? page.annots.find((a) => a.id === selectedId) || null : null;
 }
 
+// The drawn object picked with the select tool, if it is still the pick.
+function pickedObject() {
+  const page = currentPage();
+  return selectedObj && page && selectedObj.pageId === page.id && tool === "select" ? selectedObj : null;
+}
+
 function snapshot() {
   const page = currentPage();
   return { pages: structuredClone(doc.pages), currentId: page ? page.id : null, version };
@@ -283,6 +294,7 @@ function sweepPristine(keepId) {
 
 function restore(snap) {
   pristine = null;
+  selectedObj = null;
   selectSeq++;
   doc.pages = snap.pages;
   version = snap.version;
@@ -358,6 +370,10 @@ async function openFiles(fileList, append) {
       guessWanted = "";
       loadedBlocks.clear();
       blocksFailed.clear();
+      pageObjects.clear();
+      loadedObjects.clear();
+      objectsFailed.clear();
+      selectedObj = null;
       pristine = null;
       libDocs.clear();
       undoStack = [];
@@ -496,16 +512,20 @@ let guessWanted = "";
 
 const editsOf = (page) => page.annots.filter((a) => a.type === "text" && a.replaces);
 const replacesJson = (r) => JSON.stringify({ ...r, fill: undefined });
-const sigOf = (list) => JSON.stringify([...list].sort((p, q) => p.block - q.block).map((r) => [r.block, replacesJson(r)]));
+const sigOf = (list, objs = []) => JSON.stringify([[...list].sort((p, q) => p.block - q.block).map((r) => [r.block, replacesJson(r)]), [...objs].sort((p, q) => p - q)]);
+// Ids of the drawn objects (lines, shapes, images) taken out of the page.
+const removalsOf = (page) => page.annots.filter((a) => a.type === "remove").map((a) => a.object.id);
 const originalOf = (block) => ({ block: block.index, x: block.x, y: block.y, w: block.w, h: block.h, size: block.size });
 
 // The stripped page, while it still matches the page's edits (it may have
 // been made for fewer of them).
 function strippedFor(page) {
   const s = stripped.get(page.id);
-  if (!s || !s.entries.size) return null;
+  if (!s || (!s.entries.size && !s.objects.length)) return null;
   const edits = editsOf(page);
-  const ok = [...s.entries].every(([block, json]) => edits.some((a) => a.replaces.block === block && replacesJson(a.replaces) === json));
+  const removals = removalsOf(page);
+  const ok = [...s.entries].every(([block, json]) => edits.some((a) => a.replaces.block === block && replacesJson(a.replaces) === json)) &&
+    s.objects.every((id) => removals.includes(id));
   return ok ? s : null;
 }
 
@@ -521,8 +541,9 @@ function ensureStripped(page) {
   // back by leaving its text as it was): draw it again.
   if (viewReady() && view.target !== strippedFor(page)) renderPage();
   const edits = editsOf(page);
-  if (!edits.length) return;
-  const sig = sigOf(edits.map((a) => a.replaces));
+  const removals = removalsOf(page);
+  if (!edits.length && !removals.length) return;
+  const sig = sigOf(edits.map((a) => a.replaces), removals);
   const s = stripped.get(page.id);
   if ((s && s.sig === sig) || strippedWanted.get(page.id) === sig) return;
   if (guess && guess.pageId === page.id && guess.sig === sig) {
@@ -534,7 +555,7 @@ function ensureStripped(page) {
     return;
   }
   strippedWanted.set(page.id, sig);
-  buildStripped(page, edits.map((a) => a.replaces)).then((made) => {
+  buildStripped(page, edits.map((a) => a.replaces), removals).then((made) => {
     if (strippedWanted.get(page.id) !== sig) {
       made.pdf.destroy();
       return;
@@ -561,10 +582,11 @@ function guessStripped(block) {
     const list = editsOf(page).map((a) => a.replaces);
     if (list.some((r) => r.block === block.index)) return;
     list.push(originalOf(block));
-    const sig = sigOf(list);
+    const removals = removalsOf(page);
+    const sig = sigOf(list, removals);
     if (guessWanted === `${page.id}:${sig}`) return;
     guessWanted = `${page.id}:${sig}`;
-    buildStripped(page, list, aheadView()).then((made) => {
+    buildStripped(page, list, removals, aheadView()).then((made) => {
       if (guessWanted !== `${page.id}:${sig}`) {
         made.pdf.destroy();
         return;
@@ -579,11 +601,12 @@ function guessStripped(block) {
   }, 120);
 }
 
-async function buildStripped(page, list, ahead) {
+async function buildStripped(page, list, removals, ahead) {
   const [{ PDFLib }, pdfjs, libDoc] = await Promise.all([loadPdfLib(), loadPdfjs(), libDocOf(page.src)]);
   const tmp = await PDFLib.PDFDocument.create();
   const [copy] = await tmp.copyPages(libDoc, [page.index]);
   tmp.addPage(copy);
+  removePageObjects(PDFLib, copy, new Set(removals));
   const { done } = removePageText(PDFLib, copy, list.map((r) => ({ id: r.block, ...r })), [], new Map());
   const bytes = await tmp.save();
   const pdf = await pdfjs.getDocument({ data: bytes, isEvalSupported: false }).promise;
@@ -605,8 +628,9 @@ async function buildStripped(page, list, ahead) {
   }
   // Different page boxes would shift everything: keep the cover.
   return {
-    sig: sigOf(list),
+    sig: sigOf(list, removals),
     entries: same ? new Map(list.map((r) => [r.block, replacesJson(r)])) : new Map(),
+    objects: same ? removals : [],
     done,
     pdf,
     pdfPage,
@@ -649,6 +673,23 @@ function drawOverlay() {
   }
   const sel = selectedAnnot();
   if (sel && !(editing && editing.annotId === sel.id)) drawSelection(ctx, sel);
+  const picked = pickedObject();
+  if (tool === "select" && hoverObj && !(picked && picked.obj === hoverObj)) drawObjectBox(ctx, hoverObj, false);
+  if (picked) drawObjectBox(ctx, picked.obj, true);
+}
+
+// The frame around a drawn object (line, shape, image): dashed when only
+// pointed at, with a solid line when picked.
+function drawObjectBox(ctx, o, picked) {
+  const r = viewRect({ x1: o.x0, y1: o.y0, x2: o.x1, y2: o.y1 }, view.vp);
+  const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2601fd";
+  ctx.save();
+  ctx.strokeStyle = accent;
+  ctx.lineWidth = 1;
+  ctx.setLineDash(picked ? [] : [3, 3]);
+  ctx.globalAlpha = picked ? 1 : 0.7;
+  ctx.strokeRect(r.x - 3, r.y - 3, r.w + 6, r.h + 6);
+  ctx.restore();
 }
 
 // Edited text first hides the original: a cover in the background color
@@ -700,6 +741,7 @@ function drawBlockOutlines(ctx, only) {
 const relativeAngle = (a, rotation) => (rotation - a.rotation + 360) % 360;
 
 function drawAnnot(ctx, a, vp, rotation) {
+  if (a.type === "remove") return;
   const s = vp.scale;
   ctx.save();
   if (a.type === "rect") {
@@ -1020,6 +1062,7 @@ function distToSegment(p, a, b) {
 }
 
 function hits(a, pt) {
+  if (a.type === "remove") return false; // not drawn any more
   if (a.type === "ink") {
     const pts = a.points.map(([x, y]) => view.vp.convertToViewportPoint(x, y));
     const reach = Math.max(5, (a.width * view.vp.scale) / 2 + 2);
@@ -1096,13 +1139,23 @@ overlay.addEventListener("pointerdown", (event) => {
       // taken over, so it can be moved, resized and edited like any text.
       // The block list needs the installed-fonts permission, which can only
       // be asked for here, in a click.
+      // Failing that, a line, shape or image the page draws is picked: a thin
+      // one (a rule) before the text next to it, a larger one after it.
       let target = hit;
+      let obj = null;
+      selectedObj = null;
       if (!hit) {
         startLocalFonts();
-        target = selectBlockAt(pt);
-        if (target) lastDown = { id: target.id, time: now };
-        else if (!loadedBlocks.has(blockKey(page))) selectBlockWhenLoaded(pt);
+        ensureObjects(page);
+        obj = objectAt(pt, true);
+        if (!obj) {
+          target = selectBlockAt(pt);
+          if (target) lastDown = { id: target.id, time: now };
+          else obj = objectAt(pt, false);
+          if (!target && !obj && !loadedBlocks.has(blockKey(page))) selectBlockWhenLoaded(pt);
+        }
       }
+      if (obj) selectedObj = { pageId: page.id, obj };
       selectedId = target ? target.id : null;
       if (target) {
         syncStyleInputs(target);
@@ -1151,11 +1204,15 @@ overlay.addEventListener("pointermove", (event) => {
     const sel = selectedAnnot();
     const over = hitTest(pt);
     const blocks = loadedBlocks.get(blockKey(page));
-    const found = !over && blocks ? blockAt(blocks, pt) : null;
+    ensureObjects(page);
+    const thin = !over ? objectAt(pt, true) : null;
+    const found = !over && !thin && blocks ? blockAt(blocks, pt) : null;
     const block = found && !takenOf(page, found) ? found : null;
-    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : over || block ? "move" : "";
-    if (block !== hoverBlock) {
+    const obj = thin || (!over && !block ? objectAt(pt, false) : null);
+    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : over || block ? "move" : obj ? "pointer" : "";
+    if (block !== hoverBlock || obj !== hoverObj) {
       hoverBlock = block;
+      hoverObj = obj;
       drawOverlay();
     }
     return;
@@ -1213,7 +1270,7 @@ function selectBlockWhenLoaded(pt) {
   const seq = selectSeq;
   const at = toPdf(pt);
   ensureBlocks(page).then(() => {
-    if (seq !== selectSeq || tool !== "select" || editing || drag || selectedId != null || !viewReady() || currentPage().id !== page.id) return;
+    if (seq !== selectSeq || tool !== "select" || editing || drag || selectedId != null || selectedObj || !viewReady() || currentPage().id !== page.id) return;
     const here = view.vp.convertToViewportPoint(at[0], at[1]);
     if (hitTest(here)) return;
     const a = selectBlockAt(here);
@@ -1244,8 +1301,9 @@ function endDrag() {
 
 overlay.addEventListener("pointerup", endDrag);
 overlay.addEventListener("pointerleave", () => {
-  if (!hoverBlock) return;
+  if (!hoverBlock && !hoverObj) return;
   hoverBlock = null;
+  hoverObj = null;
   drawOverlay();
 });
 overlay.addEventListener("pointercancel", endDrag);
@@ -1664,6 +1722,7 @@ function goTo(i) {
   commitEditor();
   sweepPristine();
   selectSeq++;
+  selectedObj = null;
   current = i;
   selectedId = null;
   [...thumbs.children].forEach((el, j) => el.classList.toggle("is-current", j === i));
@@ -2132,6 +2191,49 @@ function ensureBlocks(page) {
   return loadBlocks(page).then(() => {}, () => { blocksFailed.add(key); });
 }
 
+// Loads the drawn objects (lines, shapes, images) of a page for the select
+// tool. Quiet: a page whose content cannot be read just has none to pick.
+function ensureObjects(page) {
+  const key = blockKey(page);
+  if (loadedObjects.has(key) || pageObjects.has(key) || objectsFailed.has(key)) return;
+  const promise = (async () => {
+    const [{ PDFLib }, libDoc] = await Promise.all([loadPdfLib(), libDocOf(page.src)]);
+    return collectPageObjects(PDFLib, libDoc.getPage(page.index));
+  })();
+  pageObjects.set(key, promise);
+  promise.then((list) => loadedObjects.set(key, list), () => {
+    pageObjects.delete(key);
+    objectsFailed.add(key);
+  });
+}
+
+// The drawn object under the point that is still on the page, the smallest
+// one. thinOnly: only rules, as thin as a line (and not a background that
+// covers most of the page, which would be picked by every click).
+function objectAt(pt, thinOnly) {
+  const page = currentPage();
+  const list = loadedObjects.get(blockKey(page));
+  if (!list || !viewReady()) return null;
+  const removed = new Set(removalsOf(page));
+  const pageArea = view.vp.width * view.vp.height;
+  let best = null;
+  let bestArea = Infinity;
+  for (const o of list) {
+    if (removed.has(o.id)) continue;
+    const r = viewRect({ x1: o.x0, y1: o.y0, x2: o.x1, y2: o.y1 }, view.vp);
+    const area = r.w * r.h;
+    if (area > pageArea * 0.6) continue;
+    if (thinOnly && Math.min(r.w, r.h) >= 8) continue;
+    const pad = 4;
+    if (pt[0] < r.x - pad || pt[0] > r.x + r.w + pad || pt[1] < r.y - pad || pt[1] > r.y + r.h + pad) continue;
+    if (area <= bestArea) { // of equal ones the later, drawn on top
+      best = o;
+      bestArea = area;
+    }
+  }
+  return best;
+}
+
 // The text annotation that stands in for an original block.
 function blockAnnot(block) {
   const sampled = sampleBackground(block);
@@ -2421,6 +2523,9 @@ async function buildPdf(PDFLib, fontkit) {
     const pg = copied.get(page.id);
     pg.setRotation(degrees(rotationOf(page)));
     const pdfPage = await pdfPageOf(page);
+    // Lines, shapes and images taken out of the page.
+    const removed = page.annots.filter((a) => a.type === "remove").map((a) => a.object.id);
+    if (removed.length) removePageObjects(PDFLib, pg, new Set(removed));
     // Edited blocks: take the original strings out of the page content
     // (lib/pdf-rewrite.js). This has to come before pdf-lib draws anything,
     // as it replaces the page's content streams. Text it cannot find (inside
@@ -2435,6 +2540,7 @@ async function buildPdf(PDFLib, fontkit) {
       }
     }
     for (const a of page.annots) {
+      if (a.type === "remove") continue;
       const color = a.color ? hexToRgb(rgb, a.color) : undefined;
       if (a.type === "rect") {
         const x = Math.min(a.x1, a.x2);
@@ -2554,6 +2660,8 @@ function setTool(name) {
   commitEditor();
   sweepPristine();
   selectSeq++;
+  selectedObj = null;
+  hoverObj = null;
   tool = name;
   pageWrap.dataset.tool = name;
   if (name !== "select") colorInput.value = toolColors[colorSlot(name)];
@@ -2600,7 +2708,7 @@ function updateControls() {
   if (busy) return;
   undoBtn.disabled = !undoStack.length;
   redoBtn.disabled = !redoStack.length;
-  deleteBtn.disabled = !selectedAnnot();
+  deleteBtn.disabled = !selectedAnnot() && !pickedObject();
   prevBtn.disabled = current <= 0;
   nextBtn.disabled = current >= count - 1;
   zoomOutBtn.disabled = zoom <= ZOOM_STEPS[0];
@@ -2608,6 +2716,18 @@ function updateControls() {
 }
 
 function deleteSelected() {
+  const picked = pickedObject();
+  if (picked) {
+    // a line, shape or image the page draws: taken out of the page content
+    pushUndo();
+    currentPage().annots.push({ id: nextId++, type: "remove", object: picked.obj });
+    selectedObj = null;
+    hoverObj = null;
+    drawOverlay();
+    drawThumb(current);
+    updateControls();
+    return;
+  }
   const a = selectedAnnot();
   if (!a) return;
   const untouched = pristineAnnot() === a;
@@ -2654,7 +2774,7 @@ document.addEventListener("keydown", (event) => {
   } else if (mod || event.altKey) {
     return;
   } else if (key === "delete" || key === "backspace") {
-    if (selectedAnnot()) {
+    if (selectedAnnot() || pickedObject()) {
       event.preventDefault();
       deleteSelected();
     }
@@ -2667,6 +2787,7 @@ document.addEventListener("keydown", (event) => {
   } else if (key === "escape") {
     sweepPristine();
     selectSeq++;
+    selectedObj = null;
     selectedId = null;
     drawOverlay();
     updateControls();

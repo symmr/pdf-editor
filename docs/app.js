@@ -135,8 +135,18 @@ const imageElements = new Map();
 const measureCtx = document.createElement("canvas").getContext("2d");
 const pageBlocks = new Map(); // "src:index" -> Promise<blocks> of the original text
 const loadedBlocks = new Map(); // same, once resolved
+const blocksFailed = new Set(); // keys whose text could not be read; the select tool does not retry them
 const libDocs = new Map(); // src -> Promise<pdf-lib PDFDocument>, read only
 let hoverBlock = null;
+// An original text block taken over only because the select tool clicked it:
+// { id, pageId, json, pre }. While the annotation is unchanged it is not an
+// edit (no undo step; it is dropped when the selection moves on), and pre is
+// the snapshot from before it was taken over, which the first real change
+// pushes as its undo step.
+let pristine = null;
+// Bumped whenever the selection is decided or dropped, so a click that waited
+// for the text blocks to load does not select after the user moved on.
+let selectSeq = 0;
 
 // --- messages ---------------------------------------------------------------
 
@@ -231,7 +241,8 @@ function snapshot() {
 }
 
 function pushUndo(snap) {
-  undoStack.push(snap || snapshot());
+  undoStack.push(snap || pristineSnap() || snapshot());
+  pristine = null; // about to be changed: from here on it is an ordinary edit
   if (undoStack.length > MAX_UNDO) undoStack.shift();
   redoStack = [];
   version = ++lastVersion;
@@ -243,7 +254,35 @@ function dropUndo() {
   version = undoStack.pop().version;
 }
 
+// The pristine annotation of the page on screen, if it is still untouched.
+function pristineAnnot() {
+  if (!pristine) return null;
+  const page = doc.pages.find((p) => p.id === pristine.pageId);
+  const a = page && page.annots.find((x) => x.id === pristine.id);
+  return a && JSON.stringify(a) === pristine.json ? a : null;
+}
+
+// The state before the pristine annotation was taken over, for the undo step
+// of its first change.
+function pristineSnap() {
+  return pristineAnnot() ? pristine.pre : null;
+}
+
+// Takes the untouched pristine annotation back out (the original text shows
+// again), unless keepId is the one that stays selected.
+function sweepPristine(keepId) {
+  const a = pristineAnnot();
+  if (!a || a.id === keepId) return;
+  const page = doc.pages.find((p) => p.id === pristine.pageId);
+  pristine = null;
+  page.annots.splice(page.annots.indexOf(a), 1);
+  if (selectedId === a.id) selectedId = null;
+  drawThumb(doc.pages.indexOf(page));
+}
+
 function restore(snap) {
+  pristine = null;
+  selectSeq++;
   doc.pages = snap.pages;
   version = snap.version;
   const index = doc.pages.findIndex((p) => p.id === snap.currentId);
@@ -254,6 +293,7 @@ function restore(snap) {
 
 function undo() {
   commitEditor();
+  sweepPristine();
   if (!undoStack.length) return;
   redoStack.push(snapshot());
   restore(undoStack.pop());
@@ -261,6 +301,7 @@ function undo() {
 
 function redo() {
   commitEditor();
+  sweepPristine();
   if (!redoStack.length) return;
   undoStack.push(snapshot());
   restore(redoStack.pop());
@@ -278,6 +319,7 @@ async function openFiles(fileList, append) {
     return;
   }
   commitEditor();
+  sweepPristine();
   setBusy(true, "読み込み中…");
   showError("");
   try {
@@ -314,6 +356,8 @@ async function openFiles(fileList, append) {
       guess = null;
       guessWanted = "";
       loadedBlocks.clear();
+      blocksFailed.clear();
+      pristine = null;
       libDocs.clear();
       undoStack = [];
       redoStack = [];
@@ -599,6 +643,8 @@ function drawOverlay() {
   if (tool === "edit") {
     loadBlocks(currentPage());
     drawBlockOutlines(ctx);
+  } else if (tool === "select" && hoverBlock) {
+    drawBlockOutlines(ctx, [hoverBlock]);
   }
   const sel = selectedAnnot();
   if (sel && !(editing && editing.annotId === sel.id)) drawSelection(ctx, sel);
@@ -627,8 +673,8 @@ function coverRect(r) {
   return { x1: r.x - pad, y1: r.y - pad, x2: r.x + r.w + pad, y2: r.y + r.h + pad };
 }
 
-function drawBlockOutlines(ctx) {
-  const blocks = loadedBlocks.get(blockKey(currentPage()));
+function drawBlockOutlines(ctx, only) {
+  const blocks = only || loadedBlocks.get(blockKey(currentPage()));
   if (!blocks) return;
   const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2601fd";
   ctx.save();
@@ -926,11 +972,13 @@ overlay.addEventListener("pointerdown", (event) => {
   }
   const pt = pointerPos(event);
   const page = currentPage();
+  selectSeq++;
   if (tool === "select") {
     const sel = selectedAnnot();
     if (sel && hasHandle(sel) && onHandle(sel, pt)) {
-      bakeAlignment(sel);
-      drag = { mode: "resize", annot: sel, orig: structuredClone(sel), box: viewBox(sel, view.vp, view.rotation), before: snapshot(), moved: false };
+      // The alignment is baked into the position on the first move (below),
+      // so a press on the handle without a drag changes nothing.
+      drag = { mode: "resize", annot: sel, before: pristineSnap() || snapshot(), moved: false };
     } else {
       const hit = hitTest(pt);
       // pointerdown's default is prevented, so double clicks are detected here
@@ -943,10 +991,22 @@ overlay.addEventListener("pointerdown", (event) => {
         openEditor(hit, pt);
         return;
       }
-      selectedId = hit ? hit.id : null;
-      if (hit) {
-        syncStyleInputs(hit);
-        drag = { mode: "move", annot: hit, orig: structuredClone(hit), start: pt, startPdf: toPdf(pt), before: snapshot(), moved: false };
+      sweepPristine(hit ? hit.id : null);
+      // Nothing written there: an original text block under the pointer is
+      // taken over, so it can be moved, resized and edited like any text.
+      // The block list needs the installed-fonts permission, which can only
+      // be asked for here, in a click.
+      let target = hit;
+      if (!hit) {
+        startLocalFonts();
+        target = selectBlockAt(pt);
+        if (target) lastDown = { id: target.id, time: now };
+        else if (!loadedBlocks.has(blockKey(page))) selectBlockWhenLoaded(pt);
+      }
+      selectedId = target ? target.id : null;
+      if (target) {
+        syncStyleInputs(target);
+        drag = { mode: "move", annot: target, orig: structuredClone(target), start: pt, startPdf: toPdf(pt), before: pristineSnap() || snapshot(), moved: false };
       }
       drawOverlay();
       updateControls();
@@ -986,8 +1046,18 @@ overlay.addEventListener("pointermove", (event) => {
       return;
     }
     if (tool !== "select" || !viewReady()) return;
+    const page = currentPage();
+    if (localReady) ensureBlocks(page); // the fonts were allowed: no prompt to wait for
     const sel = selectedAnnot();
-    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : hitTest(pt) ? "move" : "";
+    const over = hitTest(pt);
+    const blocks = loadedBlocks.get(blockKey(page));
+    const found = !over && blocks ? blockAt(blocks, pt) : null;
+    const block = found && !takenOf(page, found) ? found : null;
+    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : over || block ? "move" : "";
+    if (block !== hoverBlock) {
+      hoverBlock = block;
+      drawOverlay();
+    }
     return;
   }
   const a = drag.annot;
@@ -1003,6 +1073,9 @@ overlay.addEventListener("pointermove", (event) => {
     if (!drag.moved) {
       drag.moved = true;
       pushUndo(drag.before);
+      bakeAlignment(a);
+      drag.orig = structuredClone(a);
+      drag.box = viewBox(a, view.vp, view.rotation);
     }
     const { box, orig } = drag;
     if (a.type === "rect") {
@@ -1031,6 +1104,26 @@ overlay.addEventListener("pointermove", (event) => {
   }
   drawOverlay();
 });
+
+// The click found the text blocks of the page not loaded yet: once they are,
+// the block under the point is selected, if nothing else happened meanwhile.
+// The point is kept in page coordinates, as the view may change meanwhile.
+function selectBlockWhenLoaded(pt) {
+  const page = currentPage();
+  const seq = selectSeq;
+  const at = toPdf(pt);
+  ensureBlocks(page).then(() => {
+    if (seq !== selectSeq || tool !== "select" || editing || drag || selectedId != null || !viewReady() || currentPage().id !== page.id) return;
+    const here = view.vp.convertToViewportPoint(at[0], at[1]);
+    if (hitTest(here)) return;
+    const a = selectBlockAt(here);
+    if (!a) return;
+    selectedId = a.id;
+    syncStyleInputs(a);
+    drawOverlay();
+    updateControls();
+  });
+}
 
 function endDrag() {
   if (!drag) return;
@@ -1358,6 +1451,8 @@ async function drawThumb(i) {
 function goTo(i) {
   if (i < 0 || i >= doc.pages.length) return;
   commitEditor();
+  sweepPristine();
+  selectSeq++;
   current = i;
   selectedId = null;
   [...thumbs.children].forEach((el, j) => el.classList.toggle("is-current", j === i));
@@ -1369,6 +1464,7 @@ function goTo(i) {
 
 function rotatePage(i, delta) {
   commitEditor();
+  sweepPristine();
   pushUndo();
   const page = doc.pages[i];
   page.rotation = (page.rotation + delta + 360) % 360;
@@ -1382,6 +1478,7 @@ function deletePage(i) {
     return;
   }
   commitEditor();
+  sweepPristine();
   pushUndo();
   doc.pages.splice(i, 1);
   if (current > i || current >= doc.pages.length) current--;
@@ -1393,6 +1490,7 @@ function movePage(from, to) {
   if (to > from) to--;
   if (to === from) return;
   commitEditor();
+  sweepPristine();
   pushUndo();
   const currentId = currentPage().id;
   const [page] = doc.pages.splice(from, 1);
@@ -1776,6 +1874,8 @@ function guessAlign(block, fillHex) {
   return "left";
 }
 
+const takenOf = (page, block) => page.annots.find((a) => a.type === "text" && a.replaces && a.replaces.block === block.index);
+
 // Takes over an original text block: a text annotation with the same text,
 // position, size and color replaces it, and the editor opens on it.
 function startBlockEdit(pt) {
@@ -1783,11 +1883,46 @@ function startBlockEdit(pt) {
   const blocks = loadedBlocks.get(blockKey(page));
   const block = blocks && blockAt(blocks, pt);
   if (!block) return;
-  const taken = page.annots.find((a) => a.type === "text" && a.replaces && a.replaces.block === block.index);
+  const taken = takenOf(page, block);
   if (taken) {
     openEditor(taken);
     return;
   }
+  const a = blockAnnot(block);
+  pushUndo();
+  page.annots.push(a);
+  ensureGlyphs(a.text, a);
+  openEditor(a, null, true);
+}
+
+// The select tool clicked an original text block: takes it over as a text
+// annotation and selects it, so it can be moved, resized and restyled like
+// any text. It is not an edit until something changes (see pristine).
+function selectBlockAt(pt) {
+  const page = currentPage();
+  const blocks = loadedBlocks.get(blockKey(page));
+  const block = blocks && blockAt(blocks, pt);
+  if (!block) return null;
+  // One already taken over is reached through hitTest; clicking where it was
+  // (it moved, or its text is gone) selects nothing.
+  if (takenOf(page, block)) return null;
+  const pre = snapshot();
+  const a = blockAnnot(block);
+  page.annots.push(a);
+  pristine = { id: a.id, pageId: page.id, json: JSON.stringify(a), pre };
+  ensureGlyphs(a.text, a);
+  return a;
+}
+
+// Loads the text blocks of a page for the select tool. Never rejects.
+function ensureBlocks(page) {
+  const key = blockKey(page);
+  if (loadedBlocks.has(key) || blocksFailed.has(key)) return Promise.resolve();
+  return loadBlocks(page).then(() => {}, () => { blocksFailed.add(key); });
+}
+
+// The text annotation that stands in for an original block.
+function blockAnnot(block) {
   const sampled = sampleBackground(block);
   const style = mainStyle(block.runs);
   const ink = inkOf(style.color, sampled);
@@ -1801,8 +1936,7 @@ function startBlockEdit(pt) {
   // text grows or shrinks around the same left edge, center or right edge.
   const boxWidth = block.lines > 1 ? Math.round(block.w * 1.04 * 10) / 10 : null;
   const slack = boxWidth ? boxWidth - block.w : 0;
-  pushUndo();
-  const a = {
+  return {
     id: nextId++,
     type: "text",
     text: block.text,
@@ -1827,9 +1961,6 @@ function startBlockEdit(pt) {
       fill: `#${((sampled && sampled.fill) || "FFFFFF").toLowerCase()}`,
     },
   };
-  page.annots.push(a);
-  ensureGlyphs(a.text, a);
-  openEditor(a, null, true);
 }
 
 // --- images -------------------------------------------------------------------------------
@@ -1855,6 +1986,7 @@ function decodeImage(src) {
 async function insertImage(file) {
   if (!viewReady()) return;
   commitEditor();
+  sweepPristine();
   try {
     let dataUrl = await readAsDataUrl(file);
     const img = await decodeImage(dataUrl);
@@ -2158,6 +2290,7 @@ async function saveFile(filename, blob) {
 async function download() {
   if (busy || !doc.pages.length) return;
   commitEditor();
+  sweepPristine();
   setBusy(true, "PDF を作成中…");
   try {
     const { PDFLib, fontkit } = await loadPdfLib();
@@ -2181,6 +2314,8 @@ async function download() {
 
 function setTool(name) {
   commitEditor();
+  sweepPristine();
+  selectSeq++;
   tool = name;
   pageWrap.dataset.tool = name;
   if (name !== "select") colorInput.value = toolColors[colorSlot(name)];
@@ -2214,6 +2349,7 @@ window.addEventListener("resize", placeFillTip);
 
 function setZoom(next) {
   commitEditor();
+  selectSeq++;
   zoom = next;
   renderPage();
   updateControls();
@@ -2236,9 +2372,15 @@ function updateControls() {
 function deleteSelected() {
   const a = selectedAnnot();
   if (!a) return;
+  const untouched = pristineAnnot() === a;
   pushUndo();
-  const annots = currentPage().annots;
-  annots.splice(annots.indexOf(a), 1);
+  if (untouched) {
+    // an original block only selected, not yet edited: deleting erases its text
+    a.text = "";
+  } else {
+    const annots = currentPage().annots;
+    annots.splice(annots.indexOf(a), 1);
+  }
   selectedId = null;
   drawOverlay();
   drawThumb(current);
@@ -2285,6 +2427,8 @@ document.addEventListener("keydown", (event) => {
   } else if (key === "pagedown" || (key === "arrowright" && !selectedAnnot())) {
     goTo(current + 1);
   } else if (key === "escape") {
+    sweepPristine();
+    selectSeq++;
     selectedId = null;
     drawOverlay();
     updateControls();

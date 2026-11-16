@@ -294,6 +294,8 @@ function sweepPristine(keepId) {
 
 function restore(snap) {
   pristine = null;
+  coverSeq++;
+  cover = null;
   selectedObj = null;
   selectSeq++;
   doc.pages = snap.pages;
@@ -557,7 +559,7 @@ function useStripped(page, made) {
 }
 
 function ensureStripped(page) {
-  if (drag && drag.mode === "objmove") return; // an object is being moved: built when it is let go
+  if ((drag && drag.mode === "objmove") || cover) return; // an object is being moved: built when it is let go (and the page without it is ready)
   // The page on screen was drawn for other edits (one was undone, or taken
   // back by leaving its text as it was): draw it again.
   if (viewReady() && view.target !== strippedFor(page)) renderPage();
@@ -1265,6 +1267,7 @@ overlay.addEventListener("pointermove", (event) => {
       pushUndo(drag.before);
       drag.version = version;
       keepGhost(currentPage(), drag.obj);
+      startCover(currentPage(), drag.obj);
     }
     const [x, y] = toPdf(pt);
     const [dx, dy] = clampShift(drag.obj, drag.base.dx + x - drag.startPdf[0], drag.base.dy + y - drag.startPdf[1]);
@@ -2331,8 +2334,55 @@ function keepGhost(page, obj) {
   const { dx, dy } = shiftOf(page, obj.id);
   ghosts.set(`${page.id}:${obj.id}`, {
     canvas,
+    px: { x, y, w, h },
+    scale: view.vp.scale,
     box: { x1: Math.min(ux1, ux2) - dx, y1: Math.min(uy1, uy2) - dy, x2: Math.max(ux1, ux2) - dx, y2: Math.max(uy1, uy2) - dy },
   });
+}
+
+// Building the page without the moved object takes a second or more, as
+// does the final page (ensureStripped). So the one without the object is made
+// first, while the object is still being dragged: put on screen, with the
+// object cut out of the old picture (what differs from the page without it)
+// drawn at its new place, it already looks right when it is let go. The
+// final page is built after it and takes its place unnoticed.
+let cover = null; // { seq } while that page is being built
+let coverSeq = 0;
+function startCover(page, obj) {
+  const seq = ++coverSeq;
+  cover = { seq };
+  const edits = removalsOf(page).filter((e) => e.id !== obj.id);
+  edits.push({ id: obj.id, gone: true });
+  const finish = () => {
+    if (seq !== coverSeq) return;
+    cover = null;
+    if (viewReady()) drawOverlay(); // lets the final page be built
+  };
+  buildStripped(page, editsOf(page).map((a) => a.replaces), edits, aheadView()).then((made) => {
+    try {
+      const g = ghosts.get(`${page.id}:${obj.id}`);
+      const edit = removalsOf(page).find((e) => e.id === obj.id);
+      const final = edit && view && view.stripped && strippedFor(page) === view.stripped && view.stripped.objects.includes(objKey(edit));
+      if (seq === coverSeq && made.canvas && g && g.px && edit && !edit.gone && !final && viewReady() && currentPage().id === page.id &&
+          made.canvas.width === pdfCanvas.width && made.canvas.height === pdfCanvas.height &&
+          made.scale === view.vp.scale && g.scale === view.vp.scale) {
+        const { x, y, w, h } = g.px;
+        const bare = made.canvas.getContext("2d").getImageData(x, y, w, h).data;
+        const gctx = g.canvas.getContext("2d");
+        const img = gctx.getImageData(0, 0, w, h);
+        const d = img.data;
+        for (let i = 0; i < d.length; i += 4) {
+          const diff = Math.abs(d[i] - bare[i]) + Math.abs(d[i + 1] - bare[i + 1]) + Math.abs(d[i + 2] - bare[i + 2]);
+          if (diff < 16) d[i + 3] = 0;
+        }
+        gctx.putImageData(img, 0, 0);
+        pdfCanvas.getContext("2d").drawImage(made.canvas, 0, 0);
+      }
+    } finally {
+      made.pdf.destroy();
+      finish();
+    }
+  }, finish);
 }
 
 function drawGhosts(ctx, page) {

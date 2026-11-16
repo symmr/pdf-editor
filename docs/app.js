@@ -512,9 +512,29 @@ let guessWanted = "";
 
 const editsOf = (page) => page.annots.filter((a) => a.type === "text" && a.replaces);
 const replacesJson = (r) => JSON.stringify({ ...r, fill: undefined });
-const sigOf = (list, objs = []) => JSON.stringify([[...list].sort((p, q) => p.block - q.block).map((r) => [r.block, replacesJson(r)]), [...objs].sort((p, q) => p - q)]);
-// Ids of the drawn objects (lines, shapes, images) taken out of the page.
-const removalsOf = (page) => page.annots.filter((a) => a.type === "remove").map((a) => a.object.id);
+const sigOf = (list, objs = []) => JSON.stringify([[...list].sort((p, q) => p.block - q.block).map((r) => [r.block, replacesJson(r)]), objs.map(objKey).sort()]);
+// What was done to the drawn objects (lines, shapes, images) of the page:
+// [{ id, gone: true }] for the ones taken out, [{ id, dx, dy }] for the ones
+// moved (dx, dy in page user space).
+function removalsOf(page) {
+  const gone = new Set(page.annots.filter((a) => a.type === "remove").map((a) => a.object.id));
+  const edits = [...gone].map((id) => ({ id, gone: true }));
+  for (const a of page.annots) {
+    if (a.type === "shift" && !gone.has(a.object.id) && (a.dx || a.dy)) edits.push({ id: a.object.id, dx: a.dx, dy: a.dy });
+  }
+  return edits;
+}
+const objKey = (e) => (e.gone ? `${e.id}x` : `${e.id}:${e.dx.toFixed(2)}:${e.dy.toFixed(2)}`);
+// How far the page draws an object from where its content puts it.
+function shiftOf(page, id) {
+  const a = page.annots.find((x) => x.type === "shift" && x.object.id === id);
+  return a ? { dx: a.dx, dy: a.dy } : { dx: 0, dy: 0 };
+}
+// An object's box as the page draws it now.
+function shownBox(page, o) {
+  const { dx, dy } = shiftOf(page, o.id);
+  return { x1: o.x0 + dx, y1: o.y0 + dy, x2: o.x1 + dx, y2: o.y1 + dy };
+}
 const originalOf = (block) => ({ block: block.index, x: block.x, y: block.y, w: block.w, h: block.h, size: block.size });
 
 // The stripped page, while it still matches the page's edits (it may have
@@ -525,7 +545,7 @@ function strippedFor(page) {
   const edits = editsOf(page);
   const removals = removalsOf(page);
   const ok = [...s.entries].every(([block, json]) => edits.some((a) => a.replaces.block === block && replacesJson(a.replaces) === json)) &&
-    s.objects.every((id) => removals.includes(id));
+    s.objects.every((key) => removals.some((e) => objKey(e) === key));
   return ok ? s : null;
 }
 
@@ -537,6 +557,7 @@ function useStripped(page, made) {
 }
 
 function ensureStripped(page) {
+  if (drag && drag.mode === "objmove") return; // an object is being moved: built when it is let go
   // The page on screen was drawn for other edits (one was undone, or taken
   // back by leaving its text as it was): draw it again.
   if (viewReady() && view.target !== strippedFor(page)) renderPage();
@@ -606,7 +627,7 @@ async function buildStripped(page, list, removals, ahead) {
   const tmp = await PDFLib.PDFDocument.create();
   const [copy] = await tmp.copyPages(libDoc, [page.index]);
   tmp.addPage(copy);
-  removePageObjects(PDFLib, copy, new Set(removals));
+  editPageObjects(PDFLib, copy, removals);
   const { done } = removePageText(PDFLib, copy, list.map((r) => ({ id: r.block, ...r })), [], new Map());
   const bytes = await tmp.save();
   const pdf = await pdfjs.getDocument({ data: bytes, isEvalSupported: false }).promise;
@@ -630,7 +651,7 @@ async function buildStripped(page, list, removals, ahead) {
   return {
     sig: sigOf(list, removals),
     entries: same ? new Map(list.map((r) => [r.block, replacesJson(r)])) : new Map(),
-    objects: same ? removals : [],
+    objects: same ? removals.map(objKey) : [],
     done,
     pdf,
     pdfPage,
@@ -664,6 +685,7 @@ function drawOverlay() {
     const block = blocks && blocks.find((b) => b.index === open.replaces.block);
     if (block && block.text === open.text) bare = new Set([...(bare || []), open.replaces.block]);
   }
+  drawGhosts(ctx, page);
   drawAnnots(ctx, page.annots, view.vp, view.rotation, editing && editing.annotId, bare);
   if (tool === "edit") {
     loadBlocks(currentPage());
@@ -681,7 +703,7 @@ function drawOverlay() {
 // The frame around a drawn object (line, shape, image): dashed when only
 // pointed at, with a solid line when picked.
 function drawObjectBox(ctx, o, picked) {
-  const r = viewRect({ x1: o.x0, y1: o.y0, x2: o.x1, y2: o.y1 }, view.vp);
+  const r = viewRect(shownBox(currentPage(), o), view.vp);
   const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#2601fd";
   ctx.save();
   ctx.strokeStyle = accent;
@@ -741,7 +763,7 @@ function drawBlockOutlines(ctx, only) {
 const relativeAngle = (a, rotation) => (rotation - a.rotation + 360) % 360;
 
 function drawAnnot(ctx, a, vp, rotation) {
-  if (a.type === "remove") return;
+  if (a.type === "remove" || a.type === "shift") return;
   const s = vp.scale;
   ctx.save();
   if (a.type === "rect") {
@@ -1062,7 +1084,7 @@ function distToSegment(p, a, b) {
 }
 
 function hits(a, pt) {
-  if (a.type === "remove") return false; // not drawn any more
+  if (a.type === "remove" || a.type === "shift") return false; // not drawn by the editor
   if (a.type === "ink") {
     const pts = a.points.map(([x, y]) => view.vp.convertToViewportPoint(x, y));
     const reach = Math.max(5, (a.width * view.vp.scale) / 2 + 2);
@@ -1155,7 +1177,10 @@ overlay.addEventListener("pointerdown", (event) => {
           if (!target && !obj && !loadedBlocks.has(blockKey(page))) selectBlockWhenLoaded(pt);
         }
       }
-      if (obj) selectedObj = { pageId: page.id, obj };
+      if (obj) {
+        selectedObj = { pageId: page.id, obj };
+        drag = { mode: "objmove", obj, start: pt, startPdf: toPdf(pt), base: shiftOf(page, obj.id), before: pristineSnap() || snapshot(), moved: false };
+      }
       selectedId = target ? target.id : null;
       if (target) {
         syncStyleInputs(target);
@@ -1209,7 +1234,7 @@ overlay.addEventListener("pointermove", (event) => {
     const found = !over && !thin && blocks ? blockAt(blocks, pt) : null;
     const block = found && !takenOf(page, found) ? found : null;
     const obj = thin || (!over && !block ? objectAt(pt, false) : null);
-    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : over || block ? "move" : obj ? "pointer" : "";
+    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : over || block || obj ? "move" : "";
     if (block !== hoverBlock || obj !== hoverObj) {
       hoverBlock = block;
       hoverObj = obj;
@@ -1226,6 +1251,15 @@ overlay.addEventListener("pointermove", (event) => {
     }
     const [x, y] = toPdf(pt);
     translateAnnot(a, drag.orig, x - drag.startPdf[0], y - drag.startPdf[1]);
+  } else if (drag.mode === "objmove") {
+    if (!drag.moved) {
+      if (Math.hypot(pt[0] - drag.start[0], pt[1] - drag.start[1]) < 3) return;
+      drag.moved = true;
+      pushUndo(drag.before);
+      keepGhost(currentPage(), drag.obj);
+    }
+    const [x, y] = toPdf(pt);
+    setShift(currentPage(), drag.obj, drag.base.dx + x - drag.startPdf[0], drag.base.dy + y - drag.startPdf[1]);
   } else if (drag.mode === "resize") {
     if (!drag.moved) {
       drag.moved = true;
@@ -2214,13 +2248,13 @@ function objectAt(pt, thinOnly) {
   const page = currentPage();
   const list = loadedObjects.get(blockKey(page));
   if (!list || !viewReady()) return null;
-  const removed = new Set(removalsOf(page));
+  const removed = new Set(page.annots.filter((a) => a.type === "remove").map((a) => a.object.id));
   const pageArea = view.vp.width * view.vp.height;
   let best = null;
   let bestArea = Infinity;
   for (const o of list) {
     if (removed.has(o.id)) continue;
-    const r = viewRect({ x1: o.x0, y1: o.y0, x2: o.x1, y2: o.y1 }, view.vp);
+    const r = viewRect(shownBox(page, o), view.vp);
     const area = r.w * r.h;
     if (area > pageArea * 0.6) continue;
     if (thinOnly && Math.min(r.w, r.h) >= 8) continue;
@@ -2232,6 +2266,59 @@ function objectAt(pt, thinOnly) {
     }
   }
   return best;
+}
+
+// Moving a drawn object: the move is kept as a "shift" annotation, applied to
+// the page content when the page is rebuilt (editPageObjects).
+function setShift(page, obj, dx, dy) {
+  let a = page.annots.find((x) => x.type === "shift" && x.object.id === obj.id);
+  if (!a) {
+    a = { id: nextId++, type: "shift", object: obj, dx: 0, dy: 0 };
+    page.annots.push(a);
+  }
+  a.dx = dx;
+  a.dy = dy;
+}
+
+// While an object is moved the page still draws it where it was, and the page
+// without it (see ensureStripped) is only made once it is let go. Until that
+// one is on screen, a copy of the object cut out of the page is drawn at its
+// new place.
+const ghosts = new Map(); // `${page id}:${object id}` -> { canvas, box: where it was cut from, in page user space }
+function keepGhost(page, obj) {
+  const edit = removalsOf(page).find((e) => e.id === obj.id);
+  const showing = !edit || (view.stripped && strippedFor(page) === view.stripped && view.stripped.objects.includes(objKey(edit)));
+  if (!showing) return; // the page on screen is not drawing it where the move says
+  const box = shownBox(page, obj);
+  const r = viewRect(box, view.vp);
+  const dpr = window.devicePixelRatio || 1;
+  const x = Math.max(0, Math.floor((r.x - 2) * dpr));
+  const y = Math.max(0, Math.floor((r.y - 2) * dpr));
+  const w = Math.min(pdfCanvas.width - x, Math.ceil((r.w + 4) * dpr));
+  const h = Math.min(pdfCanvas.height - y, Math.ceil((r.h + 4) * dpr));
+  if (w < 1 || h < 1) return;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  canvas.getContext("2d").drawImage(pdfCanvas, x, y, w, h, 0, 0, w, h);
+  const [ux1, uy1] = view.vp.convertToPdfPoint(x / dpr, y / dpr);
+  const [ux2, uy2] = view.vp.convertToPdfPoint((x + w) / dpr, (y + h) / dpr);
+  const { dx, dy } = shiftOf(page, obj.id);
+  ghosts.set(`${page.id}:${obj.id}`, {
+    canvas,
+    box: { x1: Math.min(ux1, ux2) - dx, y1: Math.min(uy1, uy2) - dy, x2: Math.max(ux1, ux2) - dx, y2: Math.max(uy1, uy2) - dy },
+  });
+}
+
+function drawGhosts(ctx, page) {
+  const done = view.stripped && strippedFor(page) === view.stripped ? view.stripped.objects : [];
+  for (const edit of removalsOf(page)) {
+    if (edit.gone || done.includes(objKey(edit))) continue;
+    const g = ghosts.get(`${page.id}:${edit.id}`);
+    if (!g) continue;
+    const r = viewRect({ x1: g.box.x1 + edit.dx, y1: g.box.y1 + edit.dy, x2: g.box.x2 + edit.dx, y2: g.box.y2 + edit.dy }, view.vp);
+    ctx.drawImage(g.canvas, r.x, r.y, r.w, r.h);
+  }
 }
 
 // The text annotation that stands in for an original block.
@@ -2524,8 +2611,7 @@ async function buildPdf(PDFLib, fontkit) {
     pg.setRotation(degrees(rotationOf(page)));
     const pdfPage = await pdfPageOf(page);
     // Lines, shapes and images taken out of the page.
-    const removed = page.annots.filter((a) => a.type === "remove").map((a) => a.object.id);
-    if (removed.length) removePageObjects(PDFLib, pg, new Set(removed));
+    editPageObjects(PDFLib, pg, removalsOf(page));
     // Edited blocks: take the original strings out of the page content
     // (lib/pdf-rewrite.js). This has to come before pdf-lib draws anything,
     // as it replaces the page's content streams. Text it cannot find (inside
@@ -2540,7 +2626,7 @@ async function buildPdf(PDFLib, fontkit) {
       }
     }
     for (const a of page.annots) {
-      if (a.type === "remove") continue;
+      if (a.type === "remove" || a.type === "shift") continue;
       const color = a.color ? hexToRgb(rgb, a.color) : undefined;
       if (a.type === "rect") {
         const x = Math.min(a.x1, a.x2);
@@ -2720,7 +2806,12 @@ function deleteSelected() {
   if (picked) {
     // a line, shape or image the page draws: taken out of the page content
     pushUndo();
-    currentPage().annots.push({ id: nextId++, type: "remove", object: picked.obj });
+    const annots = currentPage().annots;
+    // taking it out replaces any move of it
+    for (let k = annots.length - 1; k >= 0; k -= 1) {
+      if (annots[k].type === "shift" && annots[k].object.id === picked.obj.id) annots.splice(k, 1);
+    }
+    annots.push({ id: nextId++, type: "remove", object: picked.obj });
     selectedObj = null;
     hoverObj = null;
     drawOverlay();

@@ -1,7 +1,7 @@
 // Drawn objects of a page that are not text: painted paths (lines, boxes,
 // shapes) and images. collectPageObjects lists them with their position, and
-// removePageObjects takes chosen ones out of the page content, so the saved
-// PDF no longer draws them. Only what the page content stream itself draws is
+// editPageObjects takes chosen ones out of the page content (or moves them), so the saved
+// PDF no longer draws them there. Only what the page content stream itself draws is
 // handled: objects inside form XObjects, inline images and shadings are left
 // alone. Uses parseOps from pdf-rewrite.js.
 (function () {
@@ -123,7 +123,7 @@ function walkObjects(bytes, images) {
           b.x1 += pad;
           b.y1 += pad;
         }
-        objects.push({ id: objects.length, kind: "path", ...b, start: path.start, end });
+        objects.push({ id: objects.length, kind: "path", ...b, start: path.start, end, ctm: ctm.slice() });
       }
       path = null;
       clip = false;
@@ -152,6 +152,7 @@ function walkObjects(bytes, images) {
             y1: Math.max(...ys),
             start,
             end,
+            ctm: ctm.slice(),
           });
         }
         break;
@@ -169,26 +170,51 @@ function collectPageObjects(PDFLib, page) {
   return walkObjects(bytes, imageNames(PDFLib, page)).map(({ id, kind, x0, y0, x1, y1 }) => ({ id, kind, x0, y0, x1, y1 }));
 }
 
-// Takes the objects whose ids are in the Set out of the page content.
-// Returns how many were removed. An image's data stays in the file (the
-// page's resources may be shared with other pages); it is only no longer drawn.
-function removePageObjects(PDFLib, page, ids) {
-  if (!ids.size) return 0;
+// Changes objects of the page content. edits: [{ id, gone }] or
+// [{ id, dx, dy }]: an object that is gone is no longer drawn, one with dx, dy
+// is drawn that far (in page user space) from where it was. Returns how many
+// were changed. An image's data stays in the file (the page's resources may
+// be shared with other pages); it is only no longer drawn.
+function editPageObjects(PDFLib, page, edits) {
+  if (!edits.length) return 0;
+  const byId = new Map(edits.map((e) => [e.id, e]));
   const bytes = contentBytes(PDFLib, page);
   if (!bytes) return 0;
-  const cuts = walkObjects(bytes, imageNames(PDFLib, page)).filter((o) => ids.has(o.id));
+  const cuts = walkObjects(bytes, imageNames(PDFLib, page)).filter((o) => byId.has(o.id));
   if (!cuts.length) return 0;
+  const encoder = new TextEncoder();
   const parts = [];
   let pos = 0;
   let size = 0;
+  let changed = 0;
+  const push = (part) => {
+    parts.push(part);
+    size += part.length;
+  };
   for (const cut of cuts) {
     if (cut.start < pos) continue;
-    parts.push(bytes.subarray(pos, cut.start));
-    size += cut.start - pos;
+    const edit = byId.get(cut.id);
+    push(bytes.subarray(pos, cut.start));
+    if (!edit.gone) {
+      // The shift is in page space; the object is drawn in the space the
+      // current matrix leads to, so the shift is taken back through it.
+      const [a, b, c, d] = cut.ctm;
+      const det = a * d - b * c;
+      if (Math.abs(det) < 1e-9) {
+        push(bytes.subarray(cut.start, cut.end));
+        pos = cut.end;
+        continue;
+      }
+      const lx = (edit.dx * d - edit.dy * c) / det;
+      const ly = (edit.dy * a - edit.dx * b) / det;
+      push(encoder.encode(`q 1 0 0 1 ${lx.toFixed(4)} ${ly.toFixed(4)} cm\n`));
+      push(bytes.subarray(cut.start, cut.end));
+      push(encoder.encode("\nQ\n"));
+    }
     pos = cut.end;
+    changed += 1;
   }
-  parts.push(bytes.subarray(pos));
-  size += bytes.length - pos;
+  push(bytes.subarray(pos));
   const out = new Uint8Array(size);
   let at = 0;
   for (const part of parts) {
@@ -197,10 +223,10 @@ function removePageObjects(PDFLib, page, ids) {
   }
   const context = page.doc.context;
   page.node.set(PDFLib.PDFName.of("Contents"), context.register(context.flateStream(out)));
-  return cuts.length;
+  return changed;
 }
 
-const api = { collectPageObjects, removePageObjects };
+const api = { collectPageObjects, editPageObjects };
 
 if (typeof module !== "undefined" && module.exports) module.exports = api;
 if (typeof window !== "undefined") Object.assign(window, api);

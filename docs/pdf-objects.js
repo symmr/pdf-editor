@@ -22,6 +22,10 @@ function mul(m, n) {
   ];
 }
 
+const intersect = (a, b) => (a
+  ? { x0: Math.max(a.x0, b.x0), y0: Math.max(a.y0, b.y0), x1: Math.min(a.x1, b.x1), y1: Math.min(a.y1, b.y1) }
+  : { x0: b.x0, y0: b.y0, x1: b.x1, y1: b.y1 });
+
 const apply = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
 
 // The decoded content of a page (its streams joined), or null when a stream
@@ -79,6 +83,11 @@ function walkObjects(bytes, images) {
   let lineWidth = 1;
   let path = null;
   let clip = false;
+  // The clip box in force (null: none) and whether the current fill and
+  // stroke colors are patterns (a pattern stays put when the shape moves).
+  let clipBox = null;
+  let pat = { fill: false, stroke: false };
+  const lockedOf = (m, pattern) => Math.abs(m[0] * m[3] - m[1] * m[2]) < 1e-9 || pattern;
   const num = (v) => (typeof v === "number" ? v : 0);
 
   const addPoint = (x, y) => {
@@ -109,11 +118,13 @@ function walkObjects(bytes, images) {
       continue;
     }
     if (op === "n") {
+      if (clip && path && Number.isFinite(path.bbox.x0)) clipBox = intersect(clipBox, path.bbox);
       path = null;
       clip = false;
       continue;
     }
     if (PAINT_OPS.has(op)) {
+      if (path && clip && Number.isFinite(path.bbox.x0)) clipBox = intersect(clipBox, path.bbox);
       if (path && !clip && Number.isFinite(path.bbox.x0)) {
         const b = { ...path.bbox };
         if (/^[SsBb]/.test(op)) {
@@ -123,17 +134,34 @@ function walkObjects(bytes, images) {
           b.x1 += pad;
           b.y1 += pad;
         }
-        objects.push({ id: objects.length, kind: "path", ...b, start: path.start, end, ctm: ctm.slice() });
+        const filled = /[fFBb]/.test(op);
+        const stroked = /^[SsBb]/.test(op);
+        objects.push({
+          id: objects.length,
+          kind: "path",
+          ...b,
+          start: path.start,
+          end,
+          ctm: ctm.slice(),
+          clip: clipBox && { ...clipBox },
+          locked: lockedOf(ctm, (filled && pat.fill) || (stroked && pat.stroke)),
+        });
       }
       path = null;
       clip = false;
       continue;
     }
     switch (op) {
-      case "q": saved.push({ ctm: ctm.slice(), lineWidth }); break;
+      case "q": saved.push({ ctm: ctm.slice(), lineWidth, clipBox, pat: { ...pat } }); break;
       case "Q":
-        if (saved.length) ({ ctm, lineWidth } = saved.pop());
+        if (saved.length) ({ ctm, lineWidth, clipBox, pat } = saved.pop());
         break;
+      case "cs": pat.fill = !!(a[0] && a[0].name === "Pattern"); break;
+      case "CS": pat.stroke = !!(a[0] && a[0].name === "Pattern"); break;
+      case "scn": if (a.length && a[a.length - 1] && typeof a[a.length - 1] === "object" && a[a.length - 1].name) pat.fill = true; break;
+      case "SCN": if (a.length && a[a.length - 1] && typeof a[a.length - 1] === "object" && a[a.length - 1].name) pat.stroke = true; break;
+      case "g": case "rg": case "k": pat.fill = false; break;
+      case "G": case "RG": case "K": pat.stroke = false; break;
       case "cm":
         if (a.length >= 6) ctm = mul(a.slice(0, 6).map(num), ctm);
         break;
@@ -153,6 +181,8 @@ function walkObjects(bytes, images) {
             start,
             end,
             ctm: ctm.slice(),
+            clip: clipBox && { ...clipBox },
+            locked: lockedOf(ctm, false),
           });
         }
         break;
@@ -163,30 +193,33 @@ function walkObjects(bytes, images) {
   return objects;
 }
 
-// The objects of a page: [{ id, kind, x0, y0, x1, y1 }] in user space.
+// The objects of a page: [{ id, kind, x0, y0, x1, y1, clip, locked }] in user
+// space. clip: the box the object is clipped to (null: none). locked: it
+// cannot be moved (painted with a pattern, which would stay behind).
 function collectPageObjects(PDFLib, page) {
   const bytes = contentBytes(PDFLib, page);
   if (!bytes) return [];
-  return walkObjects(bytes, imageNames(PDFLib, page)).map(({ id, kind, x0, y0, x1, y1 }) => ({ id, kind, x0, y0, x1, y1 }));
+  return walkObjects(bytes, imageNames(PDFLib, page)).map(({ id, kind, x0, y0, x1, y1, clip, locked }) => ({ id, kind, x0, y0, x1, y1, clip, locked }));
 }
 
 // Changes objects of the page content. edits: [{ id, gone }] or
 // [{ id, dx, dy }]: an object that is gone is no longer drawn, one with dx, dy
-// is drawn that far (in page user space) from where it was. Returns how many
-// were changed. An image's data stays in the file (the page's resources may
-// be shared with other pages); it is only no longer drawn.
+// is drawn that far (in page user space) from where it was. Returns the Set
+// of ids changed (an object that cannot be moved is left as it is). An
+// image's data stays in the file (the page's resources may be shared with
+// other pages); it is only no longer drawn.
 function editPageObjects(PDFLib, page, edits) {
-  if (!edits.length) return 0;
+  const applied = new Set();
+  if (!edits.length) return applied;
   const byId = new Map(edits.map((e) => [e.id, e]));
   const bytes = contentBytes(PDFLib, page);
-  if (!bytes) return 0;
+  if (!bytes) return applied;
   const cuts = walkObjects(bytes, imageNames(PDFLib, page)).filter((o) => byId.has(o.id));
-  if (!cuts.length) return 0;
+  if (!cuts.length) return applied;
   const encoder = new TextEncoder();
   const parts = [];
   let pos = 0;
   let size = 0;
-  let changed = 0;
   const push = (part) => {
     parts.push(part);
     size += part.length;
@@ -195,6 +228,11 @@ function editPageObjects(PDFLib, page, edits) {
     if (cut.start < pos) continue;
     const edit = byId.get(cut.id);
     push(bytes.subarray(pos, cut.start));
+    if (!edit.gone && cut.locked) {
+      push(bytes.subarray(cut.start, cut.end));
+      pos = cut.end;
+      continue;
+    }
     if (!edit.gone) {
       // The shift is in page space; the object is drawn in the space the
       // current matrix leads to, so the shift is taken back through it.
@@ -212,7 +250,7 @@ function editPageObjects(PDFLib, page, edits) {
       push(encoder.encode("\nQ\n"));
     }
     pos = cut.end;
-    changed += 1;
+    applied.add(cut.id);
   }
   push(bytes.subarray(pos));
   const out = new Uint8Array(size);
@@ -223,7 +261,7 @@ function editPageObjects(PDFLib, page, edits) {
   }
   const context = page.doc.context;
   page.node.set(PDFLib.PDFName.of("Contents"), context.register(context.flateStream(out)));
-  return changed;
+  return applied;
 }
 
 const api = { collectPageObjects, editPageObjects };

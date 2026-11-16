@@ -545,7 +545,7 @@ function strippedFor(page) {
   const edits = editsOf(page);
   const removals = removalsOf(page);
   const ok = [...s.entries].every(([block, json]) => edits.some((a) => a.replaces.block === block && replacesJson(a.replaces) === json)) &&
-    s.objects.every((key) => removals.some((e) => objKey(e) === key));
+    s.objects.every((key) => removals.some((e) => objKey(e) === key || (!e.gone && !key.endsWith("x") && key.split(":")[0] === String(e.id))));
   return ok ? s : null;
 }
 
@@ -627,7 +627,7 @@ async function buildStripped(page, list, removals, ahead) {
   const tmp = await PDFLib.PDFDocument.create();
   const [copy] = await tmp.copyPages(libDoc, [page.index]);
   tmp.addPage(copy);
-  editPageObjects(PDFLib, copy, removals);
+  const applied = editPageObjects(PDFLib, copy, removals);
   const { done } = removePageText(PDFLib, copy, list.map((r) => ({ id: r.block, ...r })), [], new Map());
   const bytes = await tmp.save();
   const pdf = await pdfjs.getDocument({ data: bytes, isEvalSupported: false }).promise;
@@ -651,7 +651,7 @@ async function buildStripped(page, list, removals, ahead) {
   return {
     sig: sigOf(list, removals),
     entries: same ? new Map(list.map((r) => [r.block, replacesJson(r)])) : new Map(),
-    objects: same ? removals.map(objKey) : [],
+    objects: same ? removals.filter((e) => applied.has(e.id)).map(objKey) : [],
     done,
     pdf,
     pdfPage,
@@ -1179,7 +1179,9 @@ overlay.addEventListener("pointerdown", (event) => {
       }
       if (obj) {
         selectedObj = { pageId: page.id, obj };
-        drag = { mode: "objmove", obj, start: pt, startPdf: toPdf(pt), base: shiftOf(page, obj.id), before: pristineSnap() || snapshot(), moved: false };
+        if (movable(obj)) {
+          drag = { mode: "objmove", obj, pageId: page.id, version, start: pt, startPdf: toPdf(pt), base: shiftOf(page, obj.id), before: pristineSnap() || snapshot(), moved: false };
+        }
       }
       selectedId = target ? target.id : null;
       if (target) {
@@ -1234,7 +1236,7 @@ overlay.addEventListener("pointermove", (event) => {
     const found = !over && !thin && blocks ? blockAt(blocks, pt) : null;
     const block = found && !takenOf(page, found) ? found : null;
     const obj = thin || (!over && !block ? objectAt(pt, false) : null);
-    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : over || block || obj ? "move" : "";
+    overlay.style.cursor = sel && hasHandle(sel) && onHandle(sel, pt) ? "nwse-resize" : over || block || (obj && movable(obj)) ? "move" : obj ? "pointer" : "";
     if (block !== hoverBlock || obj !== hoverObj) {
       hoverBlock = block;
       hoverObj = obj;
@@ -1252,14 +1254,21 @@ overlay.addEventListener("pointermove", (event) => {
     const [x, y] = toPdf(pt);
     translateAnnot(a, drag.orig, x - drag.startPdf[0], y - drag.startPdf[1]);
   } else if (drag.mode === "objmove") {
+    // the page changed under the drag (page turned, undo): give it up
+    if (currentPage().id !== drag.pageId || version !== drag.version) {
+      drag = null;
+      return;
+    }
     if (!drag.moved) {
       if (Math.hypot(pt[0] - drag.start[0], pt[1] - drag.start[1]) < 3) return;
       drag.moved = true;
       pushUndo(drag.before);
+      drag.version = version;
       keepGhost(currentPage(), drag.obj);
     }
     const [x, y] = toPdf(pt);
-    setShift(currentPage(), drag.obj, drag.base.dx + x - drag.startPdf[0], drag.base.dy + y - drag.startPdf[1]);
+    const [dx, dy] = clampShift(drag.obj, drag.base.dx + x - drag.startPdf[0], drag.base.dy + y - drag.startPdf[1]);
+    setShift(currentPage(), drag.obj, dx, dy);
   } else if (drag.mode === "resize") {
     if (!drag.moved) {
       drag.moved = true;
@@ -2270,6 +2279,22 @@ function objectAt(pt, thinOnly) {
 
 // Moving a drawn object: the move is kept as a "shift" annotation, applied to
 // the page content when the page is rebuilt (editPageObjects).
+// Whether the object can be moved: not when painted with a pattern, and not
+// when it is clipped to a box it does not lie inside (a cropped image would
+// be cut off where it was). Inside its clip box it stays inside.
+const CLIP_SLACK = 2;
+function movable(o) {
+  if (o.locked) return false;
+  const c = o.clip;
+  return !c || (o.x0 >= c.x0 - CLIP_SLACK && o.y0 >= c.y0 - CLIP_SLACK && o.x1 <= c.x1 + CLIP_SLACK && o.y1 <= c.y1 + CLIP_SLACK);
+}
+function clampShift(o, dx, dy) {
+  const c = o.clip;
+  if (!c) return [dx, dy];
+  const within = (v, lo, hi) => Math.min(Math.max(v, Math.min(lo, 0)), Math.max(hi, 0));
+  return [within(dx, c.x0 - o.x0, c.x1 - o.x1), within(dy, c.y0 - o.y0, c.y1 - o.y1)];
+}
+
 function setShift(page, obj, dx, dy) {
   let a = page.annots.find((x) => x.type === "shift" && x.object.id === obj.id);
   if (!a) {

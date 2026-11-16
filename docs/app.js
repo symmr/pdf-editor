@@ -738,28 +738,33 @@ function drawAnnot(ctx, a, vp, rotation) {
     ctx.rotate((relativeAngle(a, rotation) * Math.PI) / 180);
     if (a.type === "text") {
       const lh = a.lineHeight || LINE_HEIGHT;
-      ctx.font = fontSpec(a, a.size * s);
       ctx.fillStyle = a.color;
+      ctx.strokeStyle = a.color;
+      ctx.lineCap = "butt";
       ctx.textBaseline = "alphabetic";
       const layout = textLayout(a);
       layout.lines.forEach((line, i) => {
-        ctx.fillText(line, layout.offsets[i] * s, (i * lh + baselineOffset(lh, a)) * a.size * s);
-      });
-      if (a.underline) {
-        const measure = measureAt(a);
-        ctx.strokeStyle = a.color;
-        ctx.lineWidth = Math.max(0.5, underlineThickness(a) * s);
-        ctx.lineCap = "butt";
-        layout.lines.forEach((line, i) => {
-          const text = line.trimEnd();
-          if (!text) return;
-          const y = ((i * lh + baselineOffset(lh, a)) * a.size + UNDERLINE_OFFSET * a.size) * s;
-          ctx.beginPath();
-          ctx.moveTo(layout.offsets[i] * s, y);
-          ctx.lineTo((layout.offsets[i] + measure(text)) * s, y);
-          ctx.stroke();
+        const y = (i * lh + baselineOffset(lh, a)) * a.size * s;
+        let x = layout.offsets[i] * s;
+        const runs = styledRuns(a, line, layout.starts[i]);
+        runs.forEach((run, k) => {
+          ctx.font = fontSpec(a, a.size * s, run.style);
+          const w = ctx.measureText(run.text).width;
+          ctx.fillText(run.text, x, y);
+          if (run.style & UNDERLINE) {
+            // spaces at the end of a line are not underlined
+            const shown = k === runs.length - 1 ? run.text.trimEnd() : run.text;
+            if (shown) {
+              ctx.lineWidth = Math.max(0.5, underlineThickness(a, run.style) * s);
+              ctx.beginPath();
+              ctx.moveTo(x, y + UNDERLINE_OFFSET * a.size * s);
+              ctx.lineTo(x + (shown === run.text ? w : ctx.measureText(shown).width), y + UNDERLINE_OFFSET * a.size * s);
+              ctx.stroke();
+            }
+          }
+          x += w;
         });
-      }
+      });
     } else if (a.type === "image") {
       const img = imageElement(a.image);
       if (img.complete && img.naturalWidth) ctx.drawImage(img, 0, 0, a.w * s, a.h * s);
@@ -831,13 +836,76 @@ function viewRect(a, vp) {
 // Underline of a text box: a line a little below the baseline, as wide as the
 // line of text, about as thick as the font's own strokes (in points).
 const UNDERLINE_OFFSET = 0.12;
-const underlineThickness = (a) => a.size * (a.bold ? 0.075 : 0.055);
+const BOLD = 1;
+const UNDERLINE = 2;
+const underlineThickness = (a, style) => a.size * (style & BOLD ? 0.075 : 0.055);
 
-const fontSpec = (a, px) => `${a.bold ? "700 " : ""}${px}px ${fontOf(a).css}`;
+// The style of each character of a text box: a.fmt (BOLD and UNDERLINE bits
+// for every UTF-16 unit of a.text) when parts of the text differ, otherwise
+// a.bold and a.underline for all of it.
+const hasFmt = (a) => Boolean(a.fmt) && a.fmt.length === a.text.length;
+const baseStyle = (a) => (a.bold ? BOLD : 0) | (a.underline ? UNDERLINE : 0);
+const styleAt = (a, i) => (hasFmt(a) ? a.fmt[i] : baseStyle(a));
 
+// text (which starts at offset start in a.text) cut into stretches of one
+// style: [{ text, start, style }].
+function styledRuns(a, text, start) {
+  if (!hasFmt(a)) return [{ text, start, style: baseStyle(a) }];
+  const runs = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const style = a.fmt[start + i];
+    const last = runs[runs.length - 1];
+    if (last && last.style === style) last.text += text[i];
+    else runs.push({ text: text[i], start: start + i, style });
+  }
+  return runs.length ? runs : [{ text, start, style: baseStyle(a) }];
+}
+
+function allHave(a, bit) {
+  if (hasFmt(a) && a.text) return a.fmt.every((f) => f & bit);
+  return Boolean(baseStyle(a) & bit);
+}
+
+// Stores the styles of the characters: as a.bold and a.underline when they
+// are all alike, else as a.fmt.
+function setFmt(a, fmt) {
+  delete a.fmt;
+  if (!fmt.length) return;
+  if (fmt.every((f) => f === fmt[0])) {
+    a.bold = Boolean(fmt[0] & BOLD);
+    a.underline = fmt[0] & UNDERLINE ? true : undefined;
+  } else {
+    a.fmt = fmt;
+  }
+}
+
+function setStyleBit(a, bit, on) {
+  if (!a.text.length) {
+    if (bit === BOLD) a.bold = on;
+    else a.underline = on ? true : undefined;
+    return;
+  }
+  setFmt(a, Array.from({ length: a.text.length }, (_, i) => (on ? styleAt(a, i) | bit : styleAt(a, i) & ~bit)));
+}
+
+const sameFmt = (a, fmt) => fmt.length === a.text.length && fmt.every((f, i) => f === styleAt(a, i));
+
+const fontSpec = (a, px, style = baseStyle(a)) => `${style & BOLD ? "700 " : ""}${px}px ${fontOf(a).css}`;
+
+// Width of str, which starts at offset in a.text, at size 1 em = a.size.
 function measureAt(a) {
-  measureCtx.font = fontSpec(a, a.size);
-  return (str) => measureCtx.measureText(str).width;
+  if (!hasFmt(a)) {
+    measureCtx.font = fontSpec(a, a.size);
+    return (str) => measureCtx.measureText(str).width;
+  }
+  return (str, offset = 0) => {
+    let w = 0;
+    for (const run of styledRuns(a, str, offset)) {
+      measureCtx.font = fontSpec(a, a.size, run.style);
+      w += measureCtx.measureText(run.text).width;
+    }
+    return w;
+  };
 }
 
 // Lines of a text box: its own line breaks, plus wrapping at the box width
@@ -845,12 +913,23 @@ function measureAt(a) {
 // rules). The same lines are drawn on screen and written to the PDF.
 const textLayouts = new Map();
 
+// { lines, starts }: the lines and where each starts in a.text.
 function textLines(a) {
-  if (!a.boxWidth) return a.text.split("\n");
-  const key = `${a.font}|${a.bold ? 1 : 0}|${a.size}|${a.boxWidth}|${a.text}`;
+  if (!a.boxWidth) {
+    const lines = a.text.split("\n");
+    let at = 0;
+    const starts = lines.map((line) => {
+      const start = at;
+      at += line.length + 1;
+      return start;
+    });
+    return { lines, starts };
+  }
+  const key = `${a.font}|${hasFmt(a) ? a.fmt.join("") : a.bold ? 1 : 0}|${a.size}|${a.boxWidth}|${a.text}`;
   if (!textLayouts.has(key)) {
     if (textLayouts.size > 500) textLayouts.clear();
-    textLayouts.set(key, wrapText(a.text, a.boxWidth, measureAt(a)));
+    const ranges = wrapRanges(a.text, a.boxWidth, measureAt(a));
+    textLayouts.set(key, { lines: ranges.map((r) => a.text.slice(r.start, r.end)), starts: ranges.map((r) => r.start) });
   }
   return textLayouts.get(key);
 }
@@ -862,18 +941,18 @@ function textLines(a) {
 const ALIGN_FACTOR = { left: 0, center: 0.5, right: 1 };
 
 function textLayout(a) {
-  const lines = textLines(a);
+  const { lines, starts } = textLines(a);
   const measure = measureAt(a);
-  const widths = lines.map(measure);
+  const widths = lines.map((line, i) => measure(line, starts[i]));
   const f = ALIGN_FACTOR[a.align] || 0;
   const widest = Math.max(...widths, a.size * 0.5);
   const within = a.boxWidth || a.refWidth || widest;
   const offsets = widths.map((w) => (within - w) * f);
   const h = Math.max(1, lines.length) * (a.lineHeight || LINE_HEIGHT) * a.size;
-  if (a.boxWidth) return { lines, offsets, dx: 0, w: a.boxWidth, h };
+  if (a.boxWidth) return { lines, starts, offsets, dx: 0, w: a.boxWidth, h };
   const dx = Math.min(...offsets);
   const right = Math.max(...offsets.map((o, i) => o + widths[i]));
-  return { lines, offsets, dx, w: Math.max(right - dx, a.size * 0.5), h };
+  return { lines, starts, offsets, dx, w: Math.max(right - dx, a.size * 0.5), h };
 }
 
 // Size in PDF points of a text box or image, before rotation; dx is how far
@@ -1189,26 +1268,28 @@ function openEditor(annot, pt, created) {
   const [x, y] = annot ? [annot.x, annot.y] : toPdf(pt);
   const size = annot ? annot.size : Number(sizeInput.value) || 14;
   const color = annot ? annot.color : colorInput.value;
-  const bold = annot ? Boolean(annot.bold) : boldBtn.getAttribute("aria-pressed") === "true";
-  const underline = annot ? Boolean(annot.underline) : underlineBtn.getAttribute("aria-pressed") === "true";
   const font = annot ? annot.font : fontInput.value;
   const lineHeight = (annot && annot.lineHeight) || LINE_HEIGHT;
   const boxWidth = annot && annot.boxWidth;
   const align = annot ? annot.align || "left" : defaultAlign;
   const refWidth = annot && !boxWidth ? annot.refWidth : undefined;
   const [vx, vy] = view.vp.convertToViewportPoint(x, y);
-  const el = document.createElement("textarea");
+  // A div, not a textarea, so that parts of the text can be bold or underlined.
+  const el = document.createElement("div");
   el.className = "text-editor";
-  el.value = annot ? annot.text : "";
+  el.contentEditable = "true";
   el.spellcheck = false;
+  el.setAttribute("role", "textbox");
+  el.setAttribute("aria-multiline", "true");
   el.setAttribute("aria-label", "テキスト");
+  if (annot) fillEditor(el, annot);
   Object.assign(el.style, {
     left: `${vx}px`,
     top: `${vy}px`,
     fontSize: `${size * s}px`,
     fontFamily: fontOf({ font }).css,
-    fontWeight: bold ? "700" : "400",
-    textDecoration: underline ? "underline" : "none",
+    fontWeight: "400",
+    textDecoration: "none",
     lineHeight: String(lineHeight),
     whiteSpace: boxWidth ? "pre-wrap" : "pre",
     textAlign: align,
@@ -1229,11 +1310,19 @@ function openEditor(annot, pt, created) {
     if (event.key === "Escape" || (event.key === "Enter" && (event.ctrlKey || event.metaKey))) {
       event.preventDefault();
       commitEditor();
+    } else if (event.key === "Enter" && !event.isComposing) {
+      event.preventDefault();
+      document.execCommand("insertLineBreak");
     }
+  });
+  // only the text is pasted, not the style it came with
+  el.addEventListener("paste", (event) => {
+    event.preventDefault();
+    document.execCommand("insertText", false, event.clipboardData.getData("text/plain"));
   });
   el.addEventListener("blur", () => commitEditor());
   pageWrap.appendChild(el);
-  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, bold, underline, font, align, el, created: Boolean(created) };
+  editing = { annotId: annot ? annot.id : null, pageId: page.id, x, y, size, color, font, align, el, created: Boolean(created) };
   if (annot) {
     selectedId = annot.id;
     syncStyleInputs(annot);
@@ -1242,34 +1331,115 @@ function openEditor(annot, pt, created) {
   drawOverlay();
   // pointerdown's default is prevented, so nothing takes the focus back.
   el.focus({ preventScroll: true });
+  placeCaretAtEnd(el);
+  if (!annot) {
+    // new text starts in the style the buttons show
+    if (boldBtn.getAttribute("aria-pressed") === "true") document.execCommand("bold");
+    if (underlineBtn.getAttribute("aria-pressed") === "true") document.execCommand("underline");
+  }
+  syncEditorButtons();
 }
+
+// The text of the box as spans: bold and underlined stretches get their own.
+function fillEditor(el, a) {
+  for (const run of styledRuns(a, a.text, 0)) {
+    if (!run.text) continue;
+    if (!run.style) {
+      el.append(run.text);
+      continue;
+    }
+    const span = document.createElement("span");
+    span.textContent = run.text;
+    if (run.style & BOLD) span.style.fontWeight = "700";
+    if (run.style & UNDERLINE) span.style.textDecoration = "underline";
+    el.append(span);
+  }
+}
+
+// The caret goes inside the last text, so what is typed there has its style.
+function placeCaretAtEnd(el) {
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  let last = null;
+  while (walker.nextNode()) last = walker.currentNode;
+  const range = document.createRange();
+  if (last) range.setStart(last, last.length);
+  else range.setStart(el, 0);
+  range.collapse(true);
+  const selection = window.getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+// The text of the editor and the style of each of its characters. Tabs become
+// four spaces and spaces at the end are dropped, as before.
+function readEditor(el) {
+  let text = "";
+  const fmt = [];
+  const styleOf = (node) => {
+    const own = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+    let style = parseInt(getComputedStyle(own).fontWeight, 10) >= 600 ? BOLD : 0;
+    for (let n = own; n && n !== el.parentElement; n = n.parentElement) {
+      if ((getComputedStyle(n).textDecorationLine || "").includes("underline")) style |= UNDERLINE;
+    }
+    return style;
+  };
+  const push = (str, style) => {
+    text += str;
+    for (let i = 0; i < str.length; i += 1) fmt.push(style);
+  };
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      push(node.nodeValue.replace(/\r/g, "").replace(/\t/g, "    "), styleOf(node));
+    } else if (node.nodeName === "BR") {
+      push("\n", styleOf(node));
+    } else {
+      // a block the browser made for a line: it starts on a new line
+      if (node !== el && /^(DIV|P)$/.test(node.nodeName) && text && !text.endsWith("\n")) push("\n", styleOf(node));
+      node.childNodes.forEach(walk);
+    }
+  };
+  walk(el);
+  const trimmed = text.replace(/\s+$/, "");
+  return { text: trimmed, fmt: fmt.slice(0, trimmed.length) };
+}
+
+// The buttons show the style at the caret, or of the selection.
+function syncEditorButtons() {
+  boldBtn.setAttribute("aria-pressed", String(document.queryCommandState("bold")));
+  underlineBtn.setAttribute("aria-pressed", String(document.queryCommandState("underline")));
+}
+document.addEventListener("selectionchange", () => {
+  if (editing) syncEditorButtons();
+});
 
 function commitEditor() {
   if (!editing) return;
   const e = editing;
   editing = null;
-  const text = e.el.value.replace(/\t/g, "    ").replace(/\s+$/, "");
+  const { text, fmt } = readEditor(e.el);
   e.el.remove();
   const page = doc.pages.find((p) => p.id === e.pageId);
   if (page) {
     const existing = e.annotId != null ? page.annots.find((a) => a.id === e.annotId) : null;
     if (existing && e.created) {
       // the undo step was pushed when the block was taken over
-      if (text === existing.text) {
+      if (text === existing.text && sameFmt(existing, fmt)) {
         page.annots.splice(page.annots.indexOf(existing), 1);
         dropUndo();
         selectedId = null;
       } else {
         existing.text = text;
+        setFmt(existing, fmt);
       }
     } else if (existing) {
-      if (text !== existing.text) {
+      if (text !== existing.text || !sameFmt(existing, fmt)) {
         pushUndo();
         const a = page.annots.find((x) => x.id === e.annotId);
         // An edited original block stays even when emptied: its original
         // text is still removed, which erases it.
         if (text || a.replaces) {
           a.text = text;
+          setFmt(a, fmt);
         } else {
           page.annots.splice(page.annots.indexOf(a), 1);
           selectedId = null;
@@ -1277,11 +1447,14 @@ function commitEditor() {
       }
     } else if (text) {
       pushUndo();
-      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, bold: e.bold, underline: e.underline || undefined, font: e.font, align: e.align === "left" ? undefined : e.align, rotation: rotationOf(page) };
+      const a = { id: nextId++, type: "text", x: e.x, y: e.y, text, size: e.size, color: e.color, font: e.font, align: e.align === "left" ? undefined : e.align, rotation: rotationOf(page) };
+      setFmt(a, fmt);
       page.annots.push(a);
       selectedId = a.id;
     }
     ensureGlyphs(text, e);
+    const shown = selectedAnnot();
+    if (shown) syncStyleInputs(shown);
     drawThumb(doc.pages.indexOf(page));
   }
   drawOverlay();
@@ -1320,8 +1493,8 @@ function syncStyleInputs(a) {
   if (a.type === "text") {
     showAlign(a.align || "left");
     sizeInput.value = a.size;
-    boldBtn.setAttribute("aria-pressed", String(Boolean(a.bold)));
-    underlineBtn.setAttribute("aria-pressed", String(Boolean(a.underline)));
+    boldBtn.setAttribute("aria-pressed", String(allHave(a, BOLD)));
+    underlineBtn.setAttribute("aria-pressed", String(allHave(a, UNDERLINE)));
     fontInput.value = a.font || "sans";
   }
   if (a.width) widthInput.value = a.width;
@@ -1336,32 +1509,33 @@ function applyStyle(prop, value) {
   drawThumb(current);
 }
 
-boldBtn.addEventListener("click", () => {
+// Bold and underline: while the text is being edited they apply to the
+// selected part of it (or to what is typed next); otherwise to all of the
+// selected text box.
+function toggleStyle(bit, button, command) {
+  if (editing) {
+    document.execCommand(command);
+    syncEditorButtons();
+    return;
+  }
   const a = selectedAnnot();
   if (a && a.type === "text") {
     pushUndo();
-    a.bold = !a.bold;
-    boldBtn.setAttribute("aria-pressed", String(a.bold));
+    const on = !allHave(a, bit);
+    setStyleBit(a, bit, on);
+    button.setAttribute("aria-pressed", String(on));
     ensureGlyphs(a.text, a);
     drawOverlay();
     drawThumb(current);
   } else {
-    boldBtn.setAttribute("aria-pressed", String(boldBtn.getAttribute("aria-pressed") !== "true"));
+    button.setAttribute("aria-pressed", String(button.getAttribute("aria-pressed") !== "true"));
   }
-});
+}
 
-underlineBtn.addEventListener("click", () => {
-  const a = selectedAnnot();
-  if (a && a.type === "text") {
-    pushUndo();
-    a.underline = a.underline ? undefined : true;
-    underlineBtn.setAttribute("aria-pressed", String(Boolean(a.underline)));
-    drawOverlay();
-    drawThumb(current);
-  } else {
-    underlineBtn.setAttribute("aria-pressed", String(underlineBtn.getAttribute("aria-pressed") !== "true"));
-  }
-});
+// Pressing them must not take the focus (and the selection) from the editor.
+for (const button of [boldBtn, underlineBtn]) button.addEventListener("mousedown", (event) => event.preventDefault());
+boldBtn.addEventListener("click", () => toggleStyle(BOLD, boldBtn, "bold"));
+underlineBtn.addEventListener("click", () => toggleStyle(UNDERLINE, underlineBtn, "underline"));
 
 colorInput.addEventListener("change", () => {
   if (selectedAnnot()) applyStyle("color", colorInput.value);
@@ -2164,26 +2338,32 @@ async function embedFonts(out, fontkit, texts) {
 
   for (const a of texts) {
     const local = localFonts.get(a.font);
-    let key = null;
-    if (local) {
-      const face = (a.bold && local.bold) || local.regular;
-      const entry = await usable(face);
-      if (entry && [...a.text].every((ch) => /\s/.test(ch) || entry.font.hasGlyphForCodePoint(ch.codePointAt(0)))) {
-        key = `local:${face.postscriptName}`;
-        faces.set(key, face);
-      } else {
-        fontFallbacks += 1;
+    // regular and bold, whichever the text uses
+    const weights = new Set(hasFmt(a) ? a.fmt.map((f) => f & BOLD) : [baseStyle(a) & BOLD]);
+    const perWeight = {};
+    for (const bold of weights) {
+      let key = null;
+      if (local) {
+        const face = (bold && local.bold) || local.regular;
+        const entry = await usable(face);
+        if (entry && [...a.text].every((ch) => /\s/.test(ch) || entry.font.hasGlyphForCodePoint(ch.codePointAt(0)))) {
+          key = `local:${face.postscriptName}`;
+          faces.set(key, face);
+        } else {
+          fontFallbacks += 1;
+        }
       }
+      if (!key) {
+        const web = local ? FONTS[local.fallback] : fontOf(a);
+        key = bold ? web.bold : web.regular;
+      }
+      perWeight[bold] = key;
     }
-    if (!key) {
-      const web = local ? FONTS[local.fallback] : fontOf(a);
-      key = a.bold ? web.bold : web.regular;
-    }
-    keys.set(a, key);
+    keys.set(a, perWeight);
   }
 
   const embedded = new Map();
-  for (const key of new Set(keys.values())) {
+  for (const key of new Set([...keys.values()].flatMap((perWeight) => Object.values(perWeight)))) {
     if (faces.has(key)) {
       const face = faces.get(key);
       wanted = face.postscriptName;
@@ -2193,7 +2373,7 @@ async function embedFonts(out, fontkit, texts) {
       embedded.set(key, await out.embedFont(bytes, { subset: true }));
     }
   }
-  return (a) => embedded.get(keys.get(a));
+  return (a, bold) => embedded.get(keys.get(a)[bold ? 1 : 0]);
 }
 
 async function buildPdf(PDFLib, fontkit) {
@@ -2284,20 +2464,29 @@ async function buildPdf(PDFLib, fontkit) {
           const layout = textLayout(a);
           layout.lines.forEach((line, i) => {
             if (!line) return;
-            const [x, y] = vp.convertToPdfPoint(vx + layout.offsets[i], vy + (i * lh + baselineOffset(lh, a)) * a.size);
-            pg.drawText(line, { x, y, size: a.size, font: fontFor(a), color, rotate: degrees(a.rotation) });
-            if (a.underline && line.trimEnd()) {
-              const width = fontFor(a).widthOfTextAtSize(line.trimEnd(), a.size);
-              const uy = vy + (i * lh + baselineOffset(lh, a)) * a.size + UNDERLINE_OFFSET * a.size;
-              const start = vp.convertToPdfPoint(vx + layout.offsets[i], uy);
-              const end = vp.convertToPdfPoint(vx + layout.offsets[i] + width, uy);
-              pg.drawLine({
-                start: { x: start[0], y: start[1] },
-                end: { x: end[0], y: end[1] },
-                thickness: underlineThickness(a),
-                color,
-              });
-            }
+            // one drawText per stretch of one style, side by side
+            let dx = layout.offsets[i];
+            const runs = styledRuns(a, line, layout.starts[i]);
+            runs.forEach((run, k) => {
+              const font = fontFor(a, run.style & BOLD);
+              const width = font.widthOfTextAtSize(run.text, a.size);
+              const [rx, ry] = vp.convertToPdfPoint(vx + dx, vy + (i * lh + baselineOffset(lh, a)) * a.size);
+              if (run.text) pg.drawText(run.text, { x: rx, y: ry, size: a.size, font, color, rotate: degrees(a.rotation) });
+              const shown = k === runs.length - 1 ? run.text.trimEnd() : run.text;
+              if (run.style & UNDERLINE && shown) {
+                const uw = shown === run.text ? width : font.widthOfTextAtSize(shown, a.size);
+                const uy = vy + (i * lh + baselineOffset(lh, a)) * a.size + UNDERLINE_OFFSET * a.size;
+                const start = vp.convertToPdfPoint(vx + dx, uy);
+                const end = vp.convertToPdfPoint(vx + dx + uw, uy);
+                pg.drawLine({
+                  start: { x: start[0], y: start[1] },
+                  end: { x: end[0], y: end[1] },
+                  thickness: underlineThickness(a, run.style),
+                  color,
+                });
+              }
+              dx += width;
+            });
           });
         } else if (a.type === "image") {
           const [x, y] = vp.convertToPdfPoint(vx, vy + a.h);
@@ -2452,7 +2641,7 @@ appendInput.addEventListener("change", () => {
 downloadBtn.addEventListener("click", download);
 
 document.addEventListener("keydown", (event) => {
-  if (step2.hidden || busy || event.target.closest("input, textarea, select")) return;
+  if (step2.hidden || busy || event.target.closest("input, textarea, select, [contenteditable]")) return;
   const key = event.key.toLowerCase();
   const mod = event.ctrlKey || event.metaKey;
   if (mod && key === "z") {
